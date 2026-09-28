@@ -599,6 +599,11 @@ def cmd_chrome(args: argparse.Namespace) -> int:
         f"--user-data-dir={lane_dir(lane) / 'chrome-profile'}",
         "--no-first-run",
         "--no-default-browser-check",
+        # Fewer background processes per lane; the same flags Puppeteer uses by default.
+        "--disable-background-networking",
+        "--disable-component-extensions-with-background-pages",
+        "--disable-default-apps",
+        "--disable-sync",
     ]
     if not args.headed:
         argv.append("--headless=new")
