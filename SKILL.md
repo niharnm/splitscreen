@@ -132,5 +132,5 @@ The same commands work on Linux. Install a browser with `agent-browser install -
 
 ## Security
 
-- A CDP port gives any local process full control of that browser or app, including its cookies. Lanes listen on localhost only. Stop them when done, and on a remote host never expose CDP ports publicly; use an SSH tunnel.
+- A CDP port gives any local process full control of that browser or app, including its cookies. Chrome and Electron bind it to localhost by default. Stop lanes when done, and on a remote host never expose CDP ports publicly; use an SSH tunnel.
 - Lanes use throwaway profiles. Never point a lane at the user's real Chrome profile or app data directory.
