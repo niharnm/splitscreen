@@ -266,7 +266,8 @@ def record_state(record: dict) -> str:
     """
     if not group_alive(record["pgid"]):
         return "stopped"
-    if pid_alive(record["pid"]) and ps_field(record["pid"], "lstart") != record.get("start"):
+    start = record.get("start")
+    if start and pid_alive(record["pid"]) and ps_field(record["pid"], "lstart") != start:
         return "foreign"
     return "running"
 
@@ -394,10 +395,16 @@ def launch(lane: dict, name: str, argv: List[str], display: str) -> Tuple[subpro
             argv, cwd=os.getcwd(), env=env, stdin=subprocess.DEVNULL,
             stdout=log, stderr=subprocess.STDOUT, start_new_session=True,
         )
+    start = ps_field(process.pid, "lstart")
+    for _ in range(5):
+        if start or process.poll() is not None:
+            break
+        time.sleep(0.1)
+        start = ps_field(process.pid, "lstart")
     record = {
         "pid": process.pid,
         "pgid": process.pid,
-        "start": ps_field(process.pid, "lstart"),
+        "start": start,
         "cmd": display,
         "cwd": os.getcwd(),
         "log": str(log_path),
@@ -407,12 +414,14 @@ def launch(lane: dict, name: str, argv: List[str], display: str) -> Tuple[subpro
     return process, record
 
 
-def wait_ready(process: subprocess.Popen, record: dict, ready: Callable[[], bool], timeout: float) -> bool:
+def wait_ready(process: Optional[subprocess.Popen], record: dict, ready: Callable[[], bool], timeout: float) -> bool:
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
         if ready():
             return True
-        if process.poll() is not None and not group_alive(record["pgid"]):
+        if process is not None:
+            process.poll()
+        if not group_alive(record["pgid"]):
             return False
         time.sleep(0.4)
     return ready()
@@ -534,8 +543,9 @@ def cmd_serve(args: argparse.Namespace) -> int:
     existing = lane.get("processes", {}).get("serve")
     if existing is not None and record_state(existing) == "running":
         if not args.restart:
-            status = "ready" if ready() else "not ready yet"
-            print(f"serve: already running, PID {existing['pid']}, {status}; log {existing['log']}")
+            if not wait_ready(None, existing, ready, args.timeout):
+                fail(f"serve is running as PID {existing['pid']} but not ready; log {existing['log']}")
+            print(f"serve: already running and ready, PID {existing['pid']}; log {existing['log']}")
             return 0
         stopped, message = stop_process(lane, "serve")
         print(message)
