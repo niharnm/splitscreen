@@ -111,7 +111,7 @@ agent-browser screenshot "$LANE_DIR/after.png"
 python3 <skill-dir>/scripts/lane.py stop
 ```
 
-`stop` closes the lane's agent-browser session, then terminates only the process groups the lane started, after confirming each recorded PID still belongs to the same process. It keeps the port claim so the worktree gets the same ports next time. Add `--release` to drop the claim and delete the lane's throwaway profiles and logs.
+`stop` closes the lane's agent-browser session, then terminates only the process groups the lane started, after confirming each recorded PID still belongs to the same process. It keeps the port claim so the worktree gets the same ports next time. Add `--release` to drop the claim and delete the lane's throwaway profiles and logs; Chrome and Electron profiles can reach hundreds of megabytes, so release lanes you no longer need.
 
 ## Inspecting lanes
 
