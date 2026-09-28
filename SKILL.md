@@ -84,7 +84,7 @@ For an installed Electron app, `--remote-debugging-port` works on any Electron b
 python3 <skill-dir>/scripts/lane.py serve --wait cdp --cmd '"/Applications/Visual Studio Code.app/Contents/MacOS/Code" --user-data-dir="$ELECTRON_USER_DATA_DIR" --extensions-dir="$LANE_DIR/extensions" --remote-debugging-port="$CDP_PORT"'
 ```
 
-Never attach to the user's own running instance. If an app has no data directory flag, ask before quitting the user's copy to test it.
+Never attach to the user's own running instance. If an app has no data directory flag, ask before quitting the user's copy to test it. Some apps also keep state outside that directory (VS Code 1.133 shares `~/.vscode-shared` across profiles), so installed-app lanes are not fully isolated from the user's copy; prefer testing your own app with the snippet above.
 
 ### 3. Test and collect evidence
 
@@ -127,7 +127,9 @@ The same commands work on Linux. Install a browser with `agent-browser install -
 - `port ... is in use`: another process owns it. Do not kill it. If it is your own server started outside `lane.py`, stop it or keep using it; otherwise run `lane.py env --move`.
 - The server moved to another port: read `$LANE_DIR/serve.log` and add the framework's strict port flag.
 - `agent-browser connect` fails: wait until `serve --wait cdp` or `chrome` reports ready, then check `lane.py status`.
+- An Electron snapshot is empty right after launch: the renderer is still loading. Wait for an element the app always renders, for example `agent-browser wait --fn "document.querySelector('#root') !== null"`, then snapshot again.
 - Elements are missing in an Electron snapshot: list targets with `agent-browser tab` and switch to the right window or webview.
+- `No active page`: the window you were attached to closed or was replaced. Run `agent-browser tab`, then `agent-browser tab t<N>` for the new window.
 - Dark mode is lost over CDP: add `--color-scheme dark` to the command.
 
 ## Security
