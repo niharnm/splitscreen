@@ -160,7 +160,18 @@ def lane_id_for(root: Path) -> str:
 
 
 def session_for(root: Path, lane_id: str) -> str:
-    slug = re.sub(r"[^a-z0-9]+", "-", root.name.lower()).strip("-")[:24].strip("-")
+    # The branch tells worktrees apart when they share a folder name.
+    label = root.name
+    try:
+        branch = subprocess.run(
+            ["git", "-C", str(root), "symbolic-ref", "--short", "-q", "HEAD"],
+            capture_output=True, text=True, timeout=10, check=False,
+        ).stdout.strip()
+    except (OSError, subprocess.TimeoutExpired):
+        branch = ""
+    if branch:
+        label = branch
+    slug = re.sub(r"[^a-z0-9]+", "-", label.lower()).strip("-")[:24].strip("-")
     return f"lane-{slug or 'root'}-{lane_id[:6]}"
 
 

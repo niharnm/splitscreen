@@ -48,6 +48,7 @@ agent-browser open "$APP_URL"
 - `serve` runs the command from the current directory with `PORT=$APP_PORT` plus the lane variables, logs to `$LANE_DIR/serve.log`, and returns once `APP_PORT` accepts connections from a process in its own process group.
 - Next.js reads `PORT`, so `next dev` or a workspace `dev` script works unchanged. Vite needs `vite --port "$APP_PORT" --strictPort`. Prefer strict port flags: a server that silently moves to another port would leave you testing someone else's app, and `serve` fails in that case.
 - `chrome` starts a dedicated headless Chrome with its own throwaway profile on `CDP_PORT`. Add `--headed` to watch it.
+- Next.js 16 dev mode can change tracked files: it points `next-env.d.ts` at `.next/dev/types`, and when it detects an agent it writes `AGENTS.md` and `CLAUDE.md` into the app unless `next.config` sets `agentRules: false`. Do not commit those changes unless they are intended.
 
 ### 2b. Electron app
 
