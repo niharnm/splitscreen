@@ -16,6 +16,7 @@ import tempfile
 import time
 import unittest
 from pathlib import Path
+from unittest import mock
 
 SCRIPT = Path(__file__).resolve().parent / "lane.py"
 sys.path.insert(0, str(SCRIPT.parent))
@@ -31,7 +32,8 @@ def listening(port: int) -> bool:
 def kill_group(pid: int) -> None:
     try:
         os.killpg(pid, signal.SIGKILL)
-    except ProcessLookupError:
+    except (ProcessLookupError, PermissionError):
+        # PermissionError: macOS reports it for a group of exited, unreaped members.
         pass
 
 
@@ -273,6 +275,56 @@ class LaneTest(unittest.TestCase):
         self.assertIn("could not record serve", result.stderr)
         leftover = subprocess.run(["pgrep", "-f", f"sleep {marker}"], capture_output=True, text=True)
         self.assertEqual(leftover.stdout.strip(), "")
+
+    def test_concurrent_serve_starts_one_server(self) -> None:
+        root = self.make_root("race")
+        port = int(self.claim(root)["APP_PORT"])
+        command = f'exec "{sys.executable}" -m http.server "$APP_PORT" --bind 127.0.0.1'
+        runs = [
+            subprocess.Popen([sys.executable, str(SCRIPT), "serve", "--cmd", command, "--timeout", "30"],
+                             cwd=root, env=self.env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+            for _ in range(2)
+        ]
+        outputs = [run.communicate(timeout=60) for run in runs]
+        record = json.loads(self.lane_file(root).read_text(encoding="utf-8"))["processes"]["serve"]
+        self.addCleanup(kill_group, record["pid"])
+        self.assertEqual([run.returncode for run in runs], [0, 0], outputs)
+        stdout = "".join(out for out, _ in outputs)
+        self.assertEqual(stdout.count("serve: ready at"), 1, stdout)
+        self.assertEqual(stdout.count("already running and ready"), 1, stdout)
+        self.assertTrue(listening(port))
+
+    def test_owner_check_requires_every_listener(self) -> None:
+        with mock.patch.object(lane_module, "listener_pids", return_value=[11, 12]), \
+                mock.patch.object(lane_module, "ps_field", side_effect=lambda pid, field: {11: "500", 12: "999"}[pid]):
+            self.assertFalse(lane_module.owned_by_group(4000, 500))
+        with mock.patch.object(lane_module, "listener_pids", return_value=[11, 12]), \
+                mock.patch.object(lane_module, "ps_field", return_value="500"):
+            self.assertTrue(lane_module.owned_by_group(4000, 500))
+        with mock.patch.object(lane_module, "listener_pids", return_value=[]), \
+                mock.patch.object(lane_module, "port_listening", return_value=True):
+            self.assertFalse(lane_module.owned_by_group(4000, 500))
+        with mock.patch.object(lane_module, "listener_pids", return_value=None):
+            self.assertIsNone(lane_module.owned_by_group(4000, 500))
+
+    @unittest.skipIf(lane_module.listener_pids(1) is None, "no lsof or ss to list listeners")
+    def test_running_server_must_still_own_its_port(self) -> None:
+        root = self.make_root("stolen-port")
+        port = int(self.claim(root)["APP_PORT"])
+        sleeper = subprocess.Popen(["sleep", "60"], start_new_session=True)
+        self.addCleanup(sleeper.wait)
+        self.addCleanup(kill_group, sleeper.pid)
+        self.write_record(root, "serve", {
+            "pid": sleeper.pid, "pgid": sleeper.pid, "start": lane_module.ps_field(sleeper.pid, "lstart"),
+        })
+        blocker = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        self.addCleanup(blocker.close)
+        blocker.bind(("127.0.0.1", port))
+        blocker.listen()
+        result = self.run_lane("serve", "--cmd", "sleep 30", "--timeout", "5", cwd=root, expect=1)
+        self.assertIn(f"but port {port} is held", result.stderr)
+        self.assertIsNone(sleeper.poll())
+        self.run_lane("stop", cwd=root)
 
     @unittest.skipIf(lane_module.find_chrome() is None, "Chrome not installed")
     def test_dedicated_chrome_exposes_cdp_and_stops(self) -> None:

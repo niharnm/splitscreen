@@ -116,6 +116,19 @@ def save_lane(lane: dict) -> None:
     os.replace(staging, directory / "lane.json")
 
 
+@contextlib.contextmanager
+def launch_lock(lane: dict) -> Iterator[None]:
+    """Serialize starting and stopping processes within one lane."""
+    directory = lane_dir(lane)
+    directory.mkdir(parents=True, exist_ok=True)
+    with open(directory / "launch.lock", "a+", encoding="utf-8") as handle:
+        fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+
+
 def update_processes(lane: dict, name: str, record: Optional[dict]) -> None:
     """Set or remove one process record, merging with the latest saved lane."""
     with registry_lock():
@@ -208,14 +221,19 @@ def port_free(port: int) -> bool:
 
 
 def listener_pids(port: int) -> Optional[List[int]]:
-    """PIDs listening on the port, or None when lsof is unavailable."""
-    if shutil.which("lsof") is None:
-        return None
-    probe = subprocess.run(
-        ["lsof", "-nP", f"-iTCP:{port}", "-sTCP:LISTEN", "-t"],
-        capture_output=True, text=True, check=False,
-    )
-    return sorted({int(token) for token in probe.stdout.split() if token.isdigit()})
+    """PIDs this user can see listening on the port, or None when no tool can list them."""
+    if shutil.which("lsof"):
+        probe = subprocess.run(
+            ["lsof", "-nP", f"-iTCP:{port}", "-sTCP:LISTEN", "-t"],
+            capture_output=True, text=True, check=False,
+        )
+        return sorted({int(token) for token in probe.stdout.split() if token.isdigit()})
+    if shutil.which("ss"):
+        probe = subprocess.run(
+            ["ss", "-Hltnp", "sport", "=", f":{port}"], capture_output=True, text=True, check=False,
+        )
+        return sorted({int(pid) for pid in re.findall(r"pid=(\d+)", probe.stdout)})
+    return None
 
 
 def describe_listeners(port: int) -> str:
@@ -259,13 +277,23 @@ def pid_alive(pid: int) -> bool:
 
 
 def group_alive(pgid: int) -> bool:
+    """Whether the group has a member that has not exited.
+
+    Exited but unreaped members (zombies) do not count. macOS answers EPERM when
+    signaling a group of only zombies, while Linux reports it as alive.
+    """
     try:
         os.killpg(pgid, 0)
     except ProcessLookupError:
         return False
     except PermissionError:
-        return True
-    return True
+        pass
+    probe = subprocess.run(["ps", "-A", "-o", "pgid=,stat="], capture_output=True, text=True, check=False)
+    for line in probe.stdout.splitlines():
+        parts = line.split()
+        if len(parts) == 2 and parts[0] == str(pgid) and not parts[1].startswith("Z"):
+            return True
+    return False
 
 
 def record_state(record: dict) -> str:
@@ -310,6 +338,8 @@ def terminate_group(pgid: int) -> bool:
             os.killpg(pgid, sig)
         except ProcessLookupError:
             return True
+        except PermissionError:
+            return not group_alive(pgid)
         deadline = time.monotonic() + grace
         while time.monotonic() < deadline:
             # Reap group members that are children of this process, if any.
@@ -322,11 +352,18 @@ def terminate_group(pgid: int) -> bool:
 
 
 def owned_by_group(port: int, pgid: int) -> Optional[bool]:
-    """Whether a listener on the port belongs to the process group; None if unknown."""
+    """Whether every listener on the port is in the process group.
+
+    Returns None when no tool can list listeners. No visible listener on a
+    listening port means its owner is a process this user cannot inspect,
+    which is never one the lane started.
+    """
     pids = listener_pids(port)
-    if not pids:
+    if pids is None:
         return None
-    return any(ps_field(pid, "pgid") == str(pgid) for pid in pids)
+    if not pids:
+        return False if port_listening(port) else None
+    return all(ps_field(pid, "pgid") == str(pgid) for pid in pids)
 
 
 def tail(path: str, lines: int = 30) -> str:
@@ -495,6 +532,22 @@ def reject_busy(port: int, role: str) -> NoReturn:
     )
 
 
+def require_owner(lane: dict, name: str, record: dict, port: int, launched: bool) -> None:
+    owner = owned_by_group(port, record["pgid"])
+    if owner is None:
+        print(f"lane: warning: cannot check who listens on port {port}; install lsof (or ss on Linux) "
+              "to verify it belongs to this lane", file=sys.stderr)
+        return
+    if owner:
+        return
+    held = describe_listeners(port) or " by a process this user cannot inspect"
+    if launched:
+        failed_start(lane, name, record,
+                     f"did not bind port {port}; it is held{held}. The command may have moved to another port")
+    fail(f"{name} is running as PID {record['pid']}, but port {port} is held{held}. "
+         "Run `lane.py stop`, then start it again")
+
+
 def failed_start(lane: dict, name: str, record: dict, reason: str) -> NoReturn:
     output = tail(record["log"])
     # This invocation just launched the group, so it is known to be ours.
@@ -584,24 +637,34 @@ def cmd_serve(args: argparse.Namespace) -> int:
         def ready() -> bool:
             return port is None or port_listening(port)
 
-    existing = lane.get("processes", {}).get("serve")
-    if existing is not None and record_state(existing) == "unverified":
-        fail("an earlier serve group is still alive but unverified; check it with `lane.py status`, "
-             "then run `lane.py stop --force`")
-    if existing is not None and record_state(existing) == "running":
-        if not args.restart:
-            if not wait_ready(None, existing, ready, args.timeout):
-                fail(f"serve is running as PID {existing['pid']} but not ready; log {existing['log']}")
-            print(f"serve: already running and ready, PID {existing['pid']}; log {existing['log']}")
-            return 0
-        stopped, message = stop_process(lane, "serve")
-        print(message)
-        if not stopped:
-            return 1
-    if port is not None and not port_free(port):
-        reject_busy(port, args.wait)
+    process: Optional[subprocess.Popen] = None
+    with launch_lock(lane):
+        lane = load_lane(lane["id"]) or lane
+        existing = lane.get("processes", {}).get("serve")
+        state = record_state(existing) if existing is not None else "stopped"
+        if state == "unverified":
+            fail("an earlier serve group is still alive but unverified; check it with `lane.py status`, "
+                 "then run `lane.py stop --force`")
+        if state == "running" and args.restart:
+            stopped, message = stop_process(lane, "serve")
+            print(message)
+            if not stopped:
+                return 1
+            state = "stopped"
+        if state == "running":
+            record = existing
+        else:
+            if port is not None and not port_free(port):
+                reject_busy(port, args.wait)
+            process, record = launch(lane, "serve", ["/bin/sh", "-c", args.cmd], args.cmd)
 
-    process, record = launch(lane, "serve", ["/bin/sh", "-c", args.cmd], args.cmd)
+    if process is None:
+        if not wait_ready(None, record, ready, args.timeout):
+            fail(f"serve is running as PID {record['pid']} but not ready; log {record['log']}")
+        if port is not None:
+            require_owner(lane, "serve", record, port, launched=False)
+        print(f"serve: already running and ready, PID {record['pid']}; log {record['log']}")
+        return 0
     if port is None:
         print(f"serve: started PID {record['pid']}; log {record['log']}")
         return 0
@@ -609,12 +672,7 @@ def cmd_serve(args: argparse.Namespace) -> int:
         if record_state(record) == "running":
             failed_start(lane, "serve", record, f"was not ready on port {port} after {args.timeout:.0f}s")
         failed_start(lane, "serve", record, "exited before it was ready")
-    if owned_by_group(port, record["pgid"]) is False:
-        failed_start(
-            lane, "serve", record,
-            f"did not bind port {port}; it is held{describe_listeners(port)}. "
-            "The command may have moved to another port",
-        )
+    require_owner(lane, "serve", record, port, launched=True)
     target = lane_values(lane)["APP_URL"] if args.wait == "app" else f"CDP port {port}"
     print(f"serve: ready at {target}, PID {record['pid']}; log {record['log']}")
     return 0
@@ -623,49 +681,56 @@ def cmd_serve(args: argparse.Namespace) -> int:
 def cmd_chrome(args: argparse.Namespace) -> int:
     lane = claim_lane(resolve_root(args.root))
     port = lane["cdp_port"]
-    existing = lane.get("processes", {}).get("chrome")
-    if existing is not None and record_state(existing) == "unverified":
-        fail("an earlier chrome group is still alive but unverified; check it with `lane.py status`, "
-             "then run `lane.py stop --force`")
-    if existing is not None and record_state(existing) == "running":
-        info = cdp_version(port)
-        if info is not None:
-            print(f"chrome: already running on CDP port {port} ({info.get('Browser', '?')})")
-            print(f"next: agent-browser connect {port}")
-            return 0
-        stopped, message = stop_process(lane, "chrome")
-        print(message)
-        if not stopped:
-            return 1
-    if not port_free(port):
-        reject_busy(port, "CDP")
-    binary = find_chrome()
-    if binary is None:
-        fail("no Chrome or Chromium found; set AGENT_BROWSER_EXECUTABLE_PATH or CHROME_PATH")
+    process: Optional[subprocess.Popen] = None
+    with launch_lock(lane):
+        lane = load_lane(lane["id"]) or lane
+        existing = lane.get("processes", {}).get("chrome")
+        state = record_state(existing) if existing is not None else "stopped"
+        if state == "unverified":
+            fail("an earlier chrome group is still alive but unverified; check it with `lane.py status`, "
+                 "then run `lane.py stop --force`")
+        if state == "running" and cdp_version(port) is None:
+            stopped, message = stop_process(lane, "chrome")
+            print(message)
+            if not stopped:
+                return 1
+            state = "stopped"
+        if state == "running":
+            record = existing
+        else:
+            if not port_free(port):
+                reject_busy(port, "CDP")
+            binary = find_chrome()
+            if binary is None:
+                fail("no Chrome or Chromium found; set AGENT_BROWSER_EXECUTABLE_PATH or CHROME_PATH")
+            argv = [
+                binary,
+                f"--remote-debugging-port={port}",
+                f"--user-data-dir={lane_dir(lane) / 'chrome-profile'}",
+                "--no-first-run",
+                "--no-default-browser-check",
+                # Fewer background processes per lane; the same flags Puppeteer uses by default.
+                "--disable-background-networking",
+                "--disable-component-extensions-with-background-pages",
+                "--disable-default-apps",
+                "--disable-sync",
+            ]
+            if not args.headed:
+                argv.append("--headless=new")
+            if sys.platform.startswith("linux") and os.geteuid() == 0:
+                argv.append("--no-sandbox")
+            argv.append("about:blank")
+            process, record = launch(lane, "chrome", argv, shlex.join(argv))
 
-    argv = [
-        binary,
-        f"--remote-debugging-port={port}",
-        f"--user-data-dir={lane_dir(lane) / 'chrome-profile'}",
-        "--no-first-run",
-        "--no-default-browser-check",
-        # Fewer background processes per lane; the same flags Puppeteer uses by default.
-        "--disable-background-networking",
-        "--disable-component-extensions-with-background-pages",
-        "--disable-default-apps",
-        "--disable-sync",
-    ]
-    if not args.headed:
-        argv.append("--headless=new")
-    if sys.platform.startswith("linux") and os.geteuid() == 0:
-        argv.append("--no-sandbox")
-    argv.append("about:blank")
-
-    process, record = launch(lane, "chrome", argv, shlex.join(argv))
+    if process is None:
+        require_owner(lane, "chrome", record, port, launched=False)
+        info = cdp_version(port) or {}
+        print(f"chrome: already running on CDP port {port} ({info.get('Browser', '?')})")
+        print(f"next: agent-browser connect {port}")
+        return 0
     if not wait_ready(process, record, lambda: cdp_version(port) is not None, args.timeout):
         failed_start(lane, "chrome", record, f"did not open CDP port {port} within {args.timeout:.0f}s")
-    if owned_by_group(port, record["pgid"]) is False:
-        failed_start(lane, "chrome", record, f"CDP port {port} is held{describe_listeners(port)}")
+    require_owner(lane, "chrome", record, port, launched=True)
     info = cdp_version(port) or {}
     print(f"chrome: ready on CDP port {port} ({info.get('Browser', '?')}), PID {record['pid']}")
     print(f"next: agent-browser connect {port}")
@@ -682,10 +747,12 @@ def cmd_stop(args: argparse.Namespace) -> int:
     closed = close_agent_browser(lane["session"])
     if closed:
         print(closed)
-    for name in list(lane.get("processes", {})):
-        stopped, message = stop_process(lane, name, force=args.force)
-        ok = ok and stopped
-        print(message)
+    with launch_lock(lane):
+        lane = load_lane(lane["id"]) or lane
+        for name in list(lane.get("processes", {})):
+            stopped, message = stop_process(lane, name, force=args.force)
+            ok = ok and stopped
+            print(message)
     if args.release:
         if not ok:
             fail("not releasing the lane while a process is still running")
@@ -717,14 +784,14 @@ def cmd_status(args: argparse.Namespace) -> int:
 
 
 def cmd_list(args: argparse.Namespace) -> int:
-    lanes = load_all_lanes()
     if args.prune:
         with registry_lock():
-            for lane_id, lane in list(lanes.items()):
+            # Decide from state read under the lock, not from an earlier snapshot.
+            for lane_id, lane in load_all_lanes().items():
                 if not Path(lane["root"]).exists() and not lane_has_live_process(lane):
                     remove_lane_dir(lane_id)
                     print(f"pruned {lane['session']} ({lane['root']})")
-                    del lanes[lane_id]
+    lanes = load_all_lanes()
     if not lanes:
         print("no lanes")
         return 0
