@@ -71,6 +71,19 @@ class ScreenTest(unittest.TestCase):
             "SPLITSCREEN_SLOTS": str(self.slots),
         })
         self.env.pop("AGENT_BROWSER_SESSION", None)
+        # A bare listening socket stands in for a dev server. python -m http.server resolves
+        # the host name before it listens, which stalls for over 30 seconds on some CI hosts.
+        self.listener = self.tmp / "listen.py"
+        self.listener.write_text(
+            "import os, socket, time\n"
+            "server = socket.socket()\n"
+            "server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)\n"
+            "server.bind(('127.0.0.1', int(os.environ['APP_PORT'])))\n"
+            "server.listen()\n"
+            "time.sleep(600)\n",
+            encoding="utf-8",
+        )
+        self.serve_cmd = f'exec "{sys.executable}" "{self.listener}"'
 
     def run_cli(self, *args: str, cwd: Path, expect: int = 0, timeout: float = 90,
                  env: Optional[dict] = None) -> subprocess.CompletedProcess:
@@ -153,7 +166,7 @@ class ScreenTest(unittest.TestCase):
         root = self.make_root("server")
         values = self.claim(root)
         port = int(values["APP_PORT"])
-        command = f'exec "{sys.executable}" -m http.server "$APP_PORT" --bind 127.0.0.1'
+        command = self.serve_cmd
         started = self.run_cli("serve", "--cmd", command, "--timeout", "30", cwd=root)
         self.assertIn(f"ready at http://localhost:{port}", started.stdout)
         self.assertTrue(listening(port))
@@ -183,13 +196,15 @@ class ScreenTest(unittest.TestCase):
     def test_serve_fails_when_listener_is_outside_the_screen(self) -> None:
         root = self.make_root("escaped")
         port = int(self.claim(root)["APP_PORT"])
-        detach = (
-            "import os, subprocess, sys, time; "
-            "subprocess.Popen([sys.executable, '-m', 'http.server', os.environ['APP_PORT'], '--bind', '127.0.0.1'], "
-            "start_new_session=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL); time.sleep(60)"
+        detach = self.tmp / "detach.py"
+        detach.write_text(
+            "import subprocess, sys, time\n"
+            f"subprocess.Popen([sys.executable, {str(self.listener)!r}], start_new_session=True)\n"
+            "time.sleep(60)\n",
+            encoding="utf-8",
         )
-        result = self.run_cli("serve", "--cmd", f'"{sys.executable}" -c "{detach}"', "--timeout", "20",
-                               cwd=root, expect=1)
+        result = self.run_cli("serve", "--cmd", f'"{sys.executable}" "{detach}"', "--timeout", "20",
+                              cwd=root, expect=1)
         for pid in screen_module.listener_pids(port) or []:
             kill_group(pid)
         self.assertIn(f"did not bind port {port}", result.stderr)
@@ -281,7 +296,7 @@ class ScreenTest(unittest.TestCase):
     def test_concurrent_serve_starts_one_server(self) -> None:
         root = self.make_root("race")
         port = int(self.claim(root)["APP_PORT"])
-        command = f'exec "{sys.executable}" -m http.server "$APP_PORT" --bind 127.0.0.1'
+        command = self.serve_cmd
         runs = [
             subprocess.Popen([sys.executable, str(SCRIPT), "serve", "--cmd", command, "--timeout", "30"],
                              cwd=root, env=self.env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
