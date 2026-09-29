@@ -1,6 +1,7 @@
 ---
 name: splitscreen
 description: Test a web or Electron app from one of several parallel AI coding agents without computer use. Each agent gets its own screen, meaning its own Git worktree, an explicit dev-server port, a dedicated Chrome or Electron instance on its own remote debugging (CDP) port, and Vercel's agent-browser CLI attached to that port to read the DOM, console errors, and network requests. Use when verifying a UI change, reproducing a UI bug, or running exploratory checks on a local web or Electron app, especially while other agents may be testing the same app. Not for native Swift, AppKit, or UIKit apps.
+license: MIT (see LICENSE)
 compatibility: Python 3.9+ on macOS or Linux, Chrome or Chromium, and the agent-browser CLI (npm install -g agent-browser).
 ---
 
