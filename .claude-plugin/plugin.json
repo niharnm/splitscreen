@@ -9,5 +9,17 @@
   "license": "MIT",
   "homepage": "https://github.com/niharnm/splitscreen",
   "repository": "https://github.com/niharnm/splitscreen",
-  "keywords": ["testing", "electron", "cdp", "agent-browser", "worktrees", "parallel-agents", "browser-automation"]
+  "keywords": [
+    "testing",
+    "electron",
+    "cdp",
+    "agent-browser",
+    "worktrees",
+    "parallel-agents",
+    "browser-automation"
+  ],
+  "documentationUrl": "https://github.com/niharnm/splitscreen#readme",
+  "supportUrl": "https://github.com/niharnm/splitscreen/issues",
+  "privacyPolicyUrl": "https://github.com/niharnm/splitscreen#privacy",
+  "termsOfServiceUrl": "https://github.com/niharnm/splitscreen/blob/main/LICENSE"
 }

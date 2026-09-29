@@ -136,6 +136,10 @@ Every command takes `--root <worktree>`, and `--help` lists all flags.
 - **Throwaway profiles.** The dedicated Chrome always gets its own profile. Electron apps get one when they honor `ELECTRON_USER_DATA_DIR`, as in the snippet above.
 - **Localhost only.** Chrome and Electron bind the debugging port to localhost, where any local process can reach it. Stop screens when you are done.
 
+## Privacy
+
+splitscreen collects nothing and sends nothing anywhere. The script only talks to your own machine: it reads and writes its state files, lists local processes and listening ports with `ps` and `lsof` or `ss`, and calls Chrome's debugging endpoint on `127.0.0.1`. It has no telemetry. Installing through the skills CLI reports an anonymous install count to skills.sh; set `DISABLE_TELEMETRY=1` to opt out. agent-browser is a separate tool with its own policies.
+
 ## Tested
 
 - CI runs the test suite on macOS and Linux with Python 3.9 and 3.13.
