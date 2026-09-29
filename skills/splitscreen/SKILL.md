@@ -26,7 +26,7 @@ Why this beats computer use:
 
 ## Workflow
 
-Resolve `<skill-dir>` as the directory containing this file. The script needs Python 3.9 or newer on macOS or Linux; `agent-browser` must be on `PATH` (`npm install -g agent-browser`).
+Resolve `<skill-dir>` as the directory containing this file. The script needs Python 3.9 or newer on macOS or Linux, `lsof` (or `ss` from iproute2 on Linux) to verify port ownership, and `agent-browser` on `PATH` (`npm install -g agent-browser`).
 
 ### 1. Claim the screen
 
@@ -34,9 +34,9 @@ Resolve `<skill-dir>` as the directory containing this file. The script needs Py
 screen="$(python3 <skill-dir>/scripts/splitscreen.py env)" && eval "$screen"
 ```
 
-This exports `APP_PORT`, `CDP_PORT`, `APP_URL`, `AGENT_BROWSER_SESSION`, `SCREEN_DIR`, `SCREEN_ROOT`, and `ELECTRON_USER_DATA_DIR`. The same worktree always gets the same ports, and two worktrees never share a slot. A new screen only takes ports that are free.
+This exports `APP_PORT`, `CDP_PORT`, `APP_URL`, `AGENT_BROWSER_SESSION`, `SCREEN_DIR`, `SCREEN_ROOT`, and `ELECTRON_USER_DATA_DIR`. The same worktree always gets the same ports, two worktrees never share them, and a new screen only takes ports that are free.
 
-Keep the two-step form: a bare `eval "$(...)"` succeeds even when the claim fails, and later commands would run with stale values or the shared default session. Shell state often does not survive between tool calls, so repeat this line at the start of every shell command that needs these values; it is idempotent.
+Keep the two-step form: a bare `eval "$(...)"` succeeds even when the claim fails, and later commands would run with stale values or the shared default session. Run the steps after `set -e`, or chain them with `&&`, so a failed claim or start stops the sequence. Shell state often does not survive between tool calls, so repeat the claim line at the start of every shell command that needs these values; it is idempotent.
 
 ### 2a. Web app
 
@@ -56,7 +56,7 @@ agent-browser open "$APP_URL"
 
 Electron must enable CDP at launch and needs its own user data directory per screen, so screens neither share storage nor collide as a second instance of the same app.
 
-When you own the app code, add this to the main process before `app.whenReady()` and before any `requestSingleInstanceLock()` call. The `app.isPackaged` check keeps shipped builds from opening a debugging port even if `CDP_PORT` happens to be set in a user's environment.
+When you own the app code, add this to the main process before `app.whenReady()` and before any `requestSingleInstanceLock()` call. The `app.isPackaged` check keeps this code from opening a debugging port in shipped builds, even if `CDP_PORT` happens to be set in a user's environment.
 
 ```js
 const fs = require('node:fs');
@@ -71,12 +71,13 @@ if (!app.isPackaged && process.env.ELECTRON_USER_DATA_DIR) {
 }
 ```
 
-Pin the renderer dev server to `APP_PORT` as in step 2a, then:
+Each instance must also load its own worktree's renderer. Start the renderer dev server on `APP_PORT` with a strict port flag, as in step 2a, and in development load `process.env.APP_URL` instead of a hardcoded `http://localhost:5173`. Otherwise every instance loads whichever renderer owns the hardcoded port, and agents test each other's code. `--wait cdp` only checks the debugging port, so confirm the page shows your worktree after connecting.
 
 ```bash
 python3 <skill-dir>/scripts/splitscreen.py serve --wait cdp --cmd '<electron dev command>'
 agent-browser connect "$CDP_PORT"
 agent-browser tab
+agent-browser get url
 ```
 
 Windows and webviews are separate targets. `agent-browser tab` lists them; switch with `agent-browser tab t2`. Integer indexes such as `tab 2` are rejected by current agent-browser releases.
@@ -113,17 +114,18 @@ agent-browser screenshot "$SCREEN_DIR/after.png"
 python3 <skill-dir>/scripts/splitscreen.py stop
 ```
 
-`stop` closes the screen's agent-browser session, then terminates only the process groups the screen started, after confirming each recorded leader PID still belongs to the same process. If a leader exited but its group lives on, `stop` lists the leftovers and signals nothing; check them, then use `stop --force`. It keeps the port claim so the worktree gets the same ports next time. Add `--release` to drop the claim and delete the screen's throwaway profiles and logs; Chrome and Electron profiles can reach hundreds of megabytes, so release screens you no longer need.
+`stop` closes the screen's agent-browser session, then terminates only the process groups the screen started, after confirming each recorded leader PID still belongs to the same process. If a leader exited but its group lives on, `stop` lists the leftovers and signals nothing; check them, then use `stop --force`. It keeps the port claim so the worktree gets the same ports next time. Add `--release` to drop the claim and delete `$SCREEN_DIR`: its throwaway profiles, logs, and anything you saved there, such as screenshots. Chrome and Electron profiles can reach hundreds of megabytes, so release screens you no longer need, after copying out any evidence you want to keep.
 
 ## Inspecting screens
 
 - `splitscreen.py status` shows this worktree's ports, listeners, processes, and log paths.
-- `splitscreen.py list` shows every screen on the machine. `splitscreen.py list --prune` drops screens whose worktree no longer exists.
-- `splitscreen.py env --move` moves this worktree to a new slot if a process outside the screen holds its ports.
+- `splitscreen.py list` shows every screen in the state directory (`$SPLITSCREEN_HOME`, else `$XDG_STATE_HOME/splitscreen`, else `~/.local/state/splitscreen`). `splitscreen.py list --prune` drops screens whose worktree no longer exists.
+- `splitscreen.py env --move` moves this worktree to a new slot, for example when a process outside the screen holds its ports or after changing `SPLITSCREEN_APP_BASE` or `SPLITSCREEN_CDP_BASE`. Screens keep their recorded ports until moved.
+- Every command accepts `--root <worktree>` to act on another worktree, and `--help` lists its flags.
 
 ## Remote hosts and CI
 
-The same commands work on Linux. `splitscreen.py chrome` looks for `google-chrome`, `google-chrome-stable`, `chromium`, or `chromium-browser` on `PATH`; for any other install, including a browser downloaded by `agent-browser install`, set `AGENT_BROWSER_EXECUTABLE_PATH` or `CHROME_PATH` to the binary. Install `lsof` (or keep `ss` from iproute2) so the screen can verify who owns its ports. The dedicated Chrome is headless by default and adds `--no-sandbox` only when running as root on Linux.
+The same commands work on Linux. Electron apps need a display there; run them under a virtual one such as `xvfb-run`. `splitscreen.py chrome` looks for `google-chrome`, `google-chrome-stable`, `chromium`, or `chromium-browser` on `PATH`; for any other install, including a browser downloaded by `agent-browser install`, set `AGENT_BROWSER_EXECUTABLE_PATH` or `CHROME_PATH` to the binary. Install `lsof` (or keep `ss` from iproute2) so the screen can verify who owns its ports. The dedicated Chrome is headless by default and adds `--no-sandbox` only when running as root on Linux.
 
 ## Troubleshooting
 
@@ -138,4 +140,4 @@ The same commands work on Linux. `splitscreen.py chrome` looks for `google-chrom
 ## Security
 
 - A CDP port gives any local process full control of that browser or app, including its cookies. Chrome and Electron bind it to localhost by default. Stop screens when done, and on a remote host never expose CDP ports publicly; use an SSH tunnel.
-- Screens use throwaway profiles. Never point a screen at the user's real Chrome profile or app data directory.
+- The dedicated Chrome always gets a throwaway profile. An Electron app gets one only when it honors `ELECTRON_USER_DATA_DIR` (the snippet above) or a data directory flag. Never point a screen at the user's real Chrome profile or app data directory.
