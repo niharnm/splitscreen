@@ -129,13 +129,27 @@ def launch_lock(screen: dict) -> Iterator[None]:
             fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
 
 
-def update_processes(screen: dict, name: str, record: Optional[dict]) -> None:
-    """Set or remove one process record, merging with the latest saved screen."""
+class ScreenReleased(Exception):
+    """The screen was released while this invocation still held a stale copy."""
+
+
+def update_processes(screen: dict, name: str, record: Optional[dict], only_if_pid: Optional[int] = None) -> None:
+    """Set or remove one process record, merging with the latest saved screen.
+
+    With only_if_pid, a removal only happens while the saved record still
+    belongs to that PID, so a stale caller cannot drop a newer process's record.
+    """
     with registry_lock():
-        fresh = load_screen(screen["id"]) or screen
+        fresh = load_screen(screen["id"])
+        if fresh is None:
+            if record is None:
+                return
+            raise ScreenReleased(screen["id"])
         processes = fresh.setdefault("processes", {})
         if record is None:
-            processes.pop(name, None)
+            current = processes.get(name)
+            if current is not None and (only_if_pid is None or current.get("pid") == only_if_pid):
+                processes.pop(name)
         else:
             processes[name] = record
         save_screen(fresh)
@@ -381,13 +395,16 @@ def claim_is_active(screen: dict) -> bool:
     return Path(screen["root"]).exists() or screen_has_live_process(screen)
 
 
-def pick_slot(screen_id: str, taken: Set[int]) -> int:
+def pick_slot(screen_id: str, taken_slots: Set[int], taken_ports: Set[int]) -> int:
     start = int(screen_id, 16) % SLOTS
     for offset in range(SLOTS):
         slot = (start + offset) % SLOTS
-        if slot in taken:
+        if slot in taken_slots:
             continue
         app_port, cdp_port = slot_ports(slot)
+        # Other screens may have been claimed under different port bases, so compare ports too.
+        if app_port in taken_ports or cdp_port in taken_ports:
+            continue
         if port_free(app_port) and port_free(cdp_port):
             return slot
     fail(f"no free screen among {SLOTS} slots; run `splitscreen.py list --prune` or stop idle screens")
@@ -396,33 +413,28 @@ def pick_slot(screen_id: str, taken: Set[int]) -> int:
 def claim_screen(root: Path, move: bool = False) -> dict:
     """Return this worktree's screen, creating it on first use.
 
-    An existing screen keeps its slot even when its ports are busy, because the
-    usual owner is this agent's own server. Use move=True to pick a new slot.
+    An existing screen keeps its recorded ports, even when they are busy (the
+    usual owner is this agent's own server) or the port bases changed since.
+    Use move=True to pick a new slot under the current bases.
     """
     screen_id = screen_id_for(root)
     with registry_lock():
         screens = load_all_screens()
-        taken = {
-            screen["slot"] for other_id, screen in screens.items()
-            if other_id != screen_id and claim_is_active(screen)
-        }
+        others = [screen for other_id, screen in screens.items() if other_id != screen_id and claim_is_active(screen)]
+        taken_slots = {screen["slot"] for screen in others}
+        taken_ports = {port for screen in others for port in (screen["app_port"], screen["cdp_port"])}
         mine = screens.get(screen_id)
-        if mine is not None and not move and 0 <= mine["slot"] < SLOTS and mine["slot"] not in taken:
-            app_port, cdp_port = slot_ports(mine["slot"])
-            if (mine["app_port"], mine["cdp_port"]) != (app_port, cdp_port):
-                if screen_has_live_process(mine):
-                    # Its processes are bound to the recorded ports; moving the numbers would orphan them.
-                    print(f"splitscreen: note: keeping ports {mine['app_port']}/{mine['cdp_port']} while processes run; "
-                          "stop the screen to apply the new port bases", file=sys.stderr)
-                else:
-                    mine["app_port"], mine["cdp_port"] = app_port, cdp_port
-                    save_screen(mine)
+        if mine is not None and not move:
+            if (mine["app_port"], mine["cdp_port"]) != slot_ports(mine["slot"]):
+                print(f"splitscreen: note: keeping ports {mine['app_port']}/{mine['cdp_port']} from an earlier "
+                      "port base; run `splitscreen.py env --move` to apply the current bases", file=sys.stderr)
             return mine
         if mine is not None and screen_has_live_process(mine):
             fail("this screen still has running processes; run `splitscreen.py stop` before moving it")
         if mine is not None:
-            taken.add(mine["slot"])
-        slot = pick_slot(screen_id, taken)
+            taken_slots.add(mine["slot"])
+            taken_ports.update((mine["app_port"], mine["cdp_port"]))
+        slot = pick_slot(screen_id, taken_slots, taken_ports)
         app_port, cdp_port = slot_ports(slot)
         screen = {
             "id": screen_id,
@@ -472,8 +484,8 @@ def launch(screen: dict, name: str, argv: List[str], display: str) -> Tuple[subp
         time.sleep(0.1)
         start = ps_field(process.pid, "lstart")
     if not start and process.poll() is None:
-        terminate_group(process.pid)
-        fail(f"could not read the start time of PID {process.pid}, so it could not be tracked; stopped it")
+        outcome = "stopped it" if terminate_group(process.pid) else "could not stop it; stop it by hand"
+        fail(f"could not read the start time of PID {process.pid}, so it could not be tracked; {outcome}")
     record = {
         "pid": process.pid,
         "pgid": process.pid,
@@ -485,10 +497,13 @@ def launch(screen: dict, name: str, argv: List[str], display: str) -> Tuple[subp
     }
     try:
         update_processes(screen, name, record)
-    except (OSError, SystemExit) as error:
+    except (OSError, SystemExit, ScreenReleased) as error:
         # Without a saved record nothing could stop this group later.
-        terminate_group(process.pid)
-        fail(f"could not record {name} ({error}); stopped PID {process.pid}")
+        reason = "the screen was released" if isinstance(error, ScreenReleased) else str(error)
+        if terminate_group(process.pid):
+            fail(f"could not record {name} ({reason}); stopped PID {process.pid}")
+        fail(f"could not record {name} ({reason}) and could not stop process group {process.pid}; "
+             "stop it by hand")
     return process, record
 
 
@@ -511,10 +526,10 @@ def stop_process(screen: dict, name: str, force: bool = False) -> Tuple[bool, st
         return True, f"{name}: not started by this screen"
     state = record_state(record)
     if state == "foreign":
-        update_processes(screen, name, None)
+        update_processes(screen, name, None, only_if_pid=record["pid"])
         return True, f"{name}: PID {record['pid']} now belongs to another process; left it running"
     if state == "stopped":
-        update_processes(screen, name, None)
+        update_processes(screen, name, None, only_if_pid=record["pid"])
         return True, f"{name}: already stopped"
     if state == "unverified" and not force:
         members = "; ".join(f"PID {pid} {command[:80]}" for pid, command in group_members(record["pgid"]))
@@ -525,7 +540,7 @@ def stop_process(screen: dict, name: str, force: bool = False) -> Tuple[bool, st
         )
     if not terminate_group(record["pgid"]):
         return False, f"{name}: process group {record['pgid']} did not exit"
-    update_processes(screen, name, None)
+    update_processes(screen, name, None, only_if_pid=record["pid"])
     return True, f"{name}: stopped PID {record['pid']}"
 
 
@@ -613,9 +628,23 @@ def close_agent_browser(session: str) -> Tuple[bool, Optional[str]]:
 # Commands -------------------------------------------------------------------
 
 
+def reload_locked(screen: dict) -> dict:
+    """Re-read a screen after taking its launch lock; fail if it was released meanwhile."""
+    fresh = load_screen(screen["id"])
+    if fresh is None:
+        fail("this screen was released while waiting; claim it again with `splitscreen.py env`")
+    return fresh
+
+
 def cmd_env(args: argparse.Namespace) -> int:
     root = resolve_root(args.root)
-    screen = claim_screen(root, move=args.move)
+    existing = load_screen(screen_id_for(root)) if args.move else None
+    if existing is not None:
+        # Moving renumbers the ports, so wait for any launch in progress on the old ones.
+        with launch_lock(existing):
+            screen = claim_screen(root, move=True)
+    else:
+        screen = claim_screen(root, move=args.move)
     values = screen_values(screen)
     if args.json:
         print(json.dumps(values, indent=2))
@@ -634,18 +663,12 @@ def cmd_env(args: argparse.Namespace) -> int:
 
 
 def cmd_serve(args: argparse.Namespace) -> int:
-    screen = claim_screen(resolve_root(args.root))
-    port = {"app": screen["app_port"], "cdp": screen["cdp_port"], "none": None}[args.wait]
-    if args.wait == "cdp":
-        def ready() -> bool:
-            return cdp_version(port) is not None
-    else:
-        def ready() -> bool:
-            return port is None or port_listening(port)
-
+    claimed = claim_screen(resolve_root(args.root))
     process: Optional[subprocess.Popen] = None
-    with launch_lock(screen):
-        screen = load_screen(screen["id"]) or screen
+    with launch_lock(claimed):
+        screen = reload_locked(claimed)
+        # Ports come from the state read under the lock, the same state the child is launched with.
+        port = {"app": screen["app_port"], "cdp": screen["cdp_port"], "none": None}[args.wait]
         existing = screen.get("processes", {}).get("serve")
         state = record_state(existing) if existing is not None else "stopped"
         if state == "unverified":
@@ -663,6 +686,11 @@ def cmd_serve(args: argparse.Namespace) -> int:
             if port is not None and not port_free(port):
                 reject_busy(port, args.wait)
             process, record = launch(screen, "serve", ["/bin/sh", "-c", args.cmd], args.cmd)
+
+    def ready() -> bool:
+        if args.wait == "cdp":
+            return cdp_version(port) is not None
+        return port is None or port_listening(port)
 
     if process is None:
         if not wait_ready(None, record, ready, args.timeout):
@@ -685,11 +713,11 @@ def cmd_serve(args: argparse.Namespace) -> int:
 
 
 def cmd_chrome(args: argparse.Namespace) -> int:
-    screen = claim_screen(resolve_root(args.root))
-    port = screen["cdp_port"]
+    claimed = claim_screen(resolve_root(args.root))
     process: Optional[subprocess.Popen] = None
-    with launch_lock(screen):
-        screen = load_screen(screen["id"]) or screen
+    with launch_lock(claimed):
+        screen = reload_locked(claimed)
+        port = screen["cdp_port"]
         existing = screen.get("processes", {}).get("chrome")
         state = record_state(existing) if existing is not None else "stopped"
         if state == "unverified":
@@ -752,18 +780,25 @@ def cmd_stop(args: argparse.Namespace) -> int:
     ok, closed = close_agent_browser(screen["session"])
     if closed:
         print(closed)
+    # Hold the launch lock through the release so no launch can slip in between.
     with launch_lock(screen):
-        screen = load_screen(screen["id"]) or screen
+        screen = load_screen(screen["id"])
+        if screen is None:
+            print("screen was already released")
+            return 0 if ok else 1
         for name in list(screen.get("processes", {})):
             stopped, message = stop_process(screen, name, force=args.force)
             ok = ok and stopped
             print(message)
-    if args.release:
-        if not ok:
-            fail("not releasing the screen while a process or browser session is still open")
-        with registry_lock():
-            remove_screen_dir(screen["id"])
-        print(f"released screen {screen['session']} and deleted {screen_dir(screen)}")
+        if args.release:
+            if not ok:
+                fail("not releasing the screen while a process or browser session is still open")
+            with registry_lock():
+                fresh = load_screen(screen["id"])
+                if fresh is not None and screen_has_live_process(fresh):
+                    fail("not releasing the screen: a process started while it was stopping")
+                remove_screen_dir(screen["id"])
+            print(f"released screen {screen['session']} and deleted {screen_dir(screen)}")
     return 0 if ok else 1
 
 
@@ -771,7 +806,8 @@ def cmd_status(args: argparse.Namespace) -> int:
     root = resolve_root(args.root)
     screen = load_screen(screen_id_for(root))
     if screen is None:
-        print(f"no screen for {root}; claim one with: eval \"$(python3 {Path(__file__).resolve()} env)\"")
+        script = shlex.quote(str(Path(__file__).resolve()))
+        print(f"no screen for {root}; claim one with: screen=\"$(python3 {script} env)\" && eval \"$screen\"")
         return 1
     print(f"screen     {screen['session']}  slot {screen['slot']}")
     print(f"root     {screen['root']}")

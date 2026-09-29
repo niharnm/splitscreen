@@ -343,7 +343,7 @@ class ScreenTest(unittest.TestCase):
         self.assertIsNone(sleeper.poll())
         self.run_cli("stop", cwd=root)
 
-    def test_running_screen_keeps_its_ports_when_bases_change(self) -> None:
+    def test_screen_keeps_recorded_ports_until_moved(self) -> None:
         root = self.make_root("rebased")
         before = self.claim(root)
         sleeper = subprocess.Popen(["sleep", "60"], start_new_session=True)
@@ -356,9 +356,42 @@ class ScreenTest(unittest.TestCase):
         running = self.run_cli("env", "--json", cwd=root, env=rebased)
         self.assertEqual(json.loads(running.stdout)["APP_PORT"], before["APP_PORT"])
         self.assertIn("keeping ports", running.stderr)
+        refused = self.run_cli("env", "--move", cwd=root, env=rebased, expect=1)
+        self.assertIn("still has running processes", refused.stderr)
         self.run_cli("stop", cwd=root)
         idle = json.loads(self.run_cli("env", "--json", cwd=root, env=rebased).stdout)
-        self.assertEqual(int(idle["APP_PORT"]), int(before["APP_PORT"]) + 100)
+        self.assertEqual(idle["APP_PORT"], before["APP_PORT"])
+        moved = json.loads(self.run_cli("env", "--move", "--json", cwd=root, env=rebased).stdout)
+        self.assertIn(int(moved["APP_PORT"]), range(self.app_base + 100, self.app_base + 100 + self.slots))
+
+    def test_new_claim_skips_ports_recorded_under_other_bases(self) -> None:
+        first = self.claim(self.make_root("old-base"))
+        taken_slot = int(first["APP_PORT"]) - self.app_base
+        shift = -1 if taken_slot < self.slots - 1 else 1
+        colliding_slot = taken_slot - shift
+        shifted = dict(self.env, SPLITSCREEN_APP_BASE=str(self.app_base + shift),
+                       SPLITSCREEN_CDP_BASE=str(self.cdp_base + shift))
+        # Pick a worktree whose first choice under the shifted bases maps onto the first screen's ports.
+        candidate = next(
+            self.tmp / f"new-base-{index}" for index in range(1000)
+            if int(hashlib.sha256(str(self.tmp / f"new-base-{index}").encode("utf-8")).hexdigest()[:12], 16)
+            % self.slots == colliding_slot
+        )
+        candidate.mkdir()
+        second = json.loads(self.run_cli("env", "--json", cwd=candidate, env=shifted).stdout)
+        self.assertNotEqual(second["APP_PORT"], first["APP_PORT"])
+        self.assertNotEqual(second["CDP_PORT"], first["CDP_PORT"])
+
+    def test_stale_removal_keeps_a_newer_record(self) -> None:
+        root = self.make_root("stale-remove")
+        self.claim(root)
+        self.write_record(root, "serve", {"pid": 2222222, "pgid": 2222222, "start": "newer launch"})
+        with mock.patch.dict(os.environ, {"SPLITSCREEN_HOME": str(self.tmp / "state")}):
+            screen = screen_module.load_screen(screen_module.screen_id_for(root))
+            screen_module.update_processes(screen, "serve", None, only_if_pid=1111111)
+            self.assertEqual(screen_module.load_screen(screen["id"])["processes"]["serve"]["pid"], 2222222)
+            screen_module.update_processes(screen, "serve", None, only_if_pid=2222222)
+            self.assertNotIn("serve", screen_module.load_screen(screen["id"])["processes"])
 
     def test_failed_session_close_fails_stop_and_blocks_release(self) -> None:
         root = self.make_root("stuck-session")
