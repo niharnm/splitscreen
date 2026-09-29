@@ -444,6 +444,24 @@ class ScreenTest(unittest.TestCase):
         self.assertIn("not releasing", blocked.stderr)
         self.assertTrue(self.screen_file(root).exists())
 
+    def test_failed_session_listing_is_not_read_as_no_session(self) -> None:
+        root = self.make_root("listing-fails")
+        self.claim(root)
+        bin_dir = self.tmp / "failing-bin"
+        bin_dir.mkdir()
+        fake = bin_dir / "agent-browser"
+        fake.write_text("#!/bin/sh\necho 'daemon socket missing' >&2\nexit 1\n", encoding="utf-8")
+        fake.chmod(0o755)
+        broken = dict(self.env, PATH=f"{bin_dir}{os.pathsep}{self.env['PATH']}")
+        result = self.run_cli("stop", "--release", cwd=root, env=broken, expect=1)
+        self.assertIn("session list exited 1", result.stdout)
+        self.assertTrue(self.screen_file(root).exists())
+
+    def test_group_counts_as_alive_when_ps_fails(self) -> None:
+        failed_ps = subprocess.CompletedProcess(["ps"], 1, "", "ps: cannot list processes")
+        with mock.patch.object(screen_module.subprocess, "run", return_value=failed_ps):
+            self.assertTrue(screen_module.group_alive(os.getpgrp()))
+
     @unittest.skipIf(screen_module.find_chrome() is None, "Chrome not installed")
     def test_dedicated_chrome_exposes_cdp_and_stops(self) -> None:
         root = self.make_root("browser")

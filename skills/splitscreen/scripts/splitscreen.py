@@ -348,6 +348,9 @@ def group_alive(pgid: int) -> bool:
     except PermissionError:
         pass
     probe = subprocess.run(["ps", "-A", "-o", "pgid=,stat="], capture_output=True, text=True, check=False)
+    if probe.returncode != 0 or not probe.stdout.strip():
+        # Without a process listing, keep the kernel's answer: the group exists.
+        return True
     for line in probe.stdout.splitlines():
         parts = line.split()
         if len(parts) == 2 and parts[0] == str(pgid) and not parts[1].startswith("Z"):
@@ -663,9 +666,16 @@ def close_agent_browser(session: str) -> Tuple[bool, Optional[str]]:
         listing = subprocess.run(
             [binary, "session", "list", "--json"], capture_output=True, text=True, timeout=20, check=False,
         )
-        sessions = json.loads(listing.stdout or "{}").get("data", {}).get("sessions", [])
+        payload = json.loads(listing.stdout) if listing.returncode == 0 else None
     except (OSError, ValueError, subprocess.TimeoutExpired) as error:
         return False, f"agent-browser: could not list sessions ({error})"
+    if listing.returncode != 0:
+        return False, f"agent-browser: session list exited {listing.returncode}: {listing.stderr.strip()[:200]}"
+    data = payload.get("data") if isinstance(payload, dict) else None
+    sessions = data.get("sessions") if isinstance(data, dict) else None
+    # An error or an unexpected shape must not read as "no open session".
+    if payload.get("success") is False or not isinstance(sessions, list):
+        return False, "agent-browser: session list returned an unexpected result"
     names = {entry if isinstance(entry, str) else entry.get("name") for entry in sessions}
     if session not in names:
         return True, "agent-browser: no open session"
