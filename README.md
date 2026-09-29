@@ -162,7 +162,7 @@ In `$SPLITSCREEN_HOME` if set, else `$XDG_STATE_HOME/splitscreen`, else `~/.loca
 
 ## Credits
 
-Built on [agent-browser](https://github.com/vercel-labs/agent-browser) by Vercel Labs. Inspired by [@isaacdyor](https://www.instagram.com/reel/DdlNfHyFOGM/)'s tip on testing Electron apps with agent-browser over CDP.
+Built on [agent-browser](https://github.com/vercel-labs/agent-browser) by Vercel Labs.
 
 If splitscreen stops your agents from fighting over the browser, a star helps other people find it.
 
