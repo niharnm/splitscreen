@@ -29,12 +29,12 @@ Resolve `<skill-dir>` as the directory containing this file. The script needs Py
 ### 1. Claim the lane
 
 ```bash
-eval "$(python3 <skill-dir>/scripts/lane.py env)"
+lane="$(python3 <skill-dir>/scripts/lane.py env)" && eval "$lane"
 ```
 
 This exports `APP_PORT`, `CDP_PORT`, `APP_URL`, `AGENT_BROWSER_SESSION`, `LANE_DIR`, `LANE_ROOT`, and `ELECTRON_USER_DATA_DIR`. The same worktree always gets the same ports, and two worktrees never share a slot. A new lane only takes ports that are free.
 
-Shell state often does not survive between tool calls. Repeat the `eval` line at the start of every shell command that needs these values; it is idempotent.
+Keep the two-step form: a bare `eval "$(...)"` succeeds even when the claim fails, and later commands would run with stale values or the shared default session. Shell state often does not survive between tool calls, so repeat this line at the start of every shell command that needs these values; it is idempotent.
 
 ### 2a. Web app
 
@@ -45,7 +45,7 @@ agent-browser connect "$CDP_PORT"
 agent-browser open "$APP_URL"
 ```
 
-- `serve` runs the command from the current directory with `PORT=$APP_PORT` plus the lane variables, logs to `$LANE_DIR/serve.log`, and returns once `APP_PORT` accepts connections from a process in its own process group.
+- `serve` runs the command from the current directory with `PORT=$APP_PORT` plus the lane variables, logs to `$LANE_DIR/serve.log`, and returns once `APP_PORT` accepts connections from a process in its own process group. Keep the command in the foreground (no trailing `&`); the lane tracks it by that process group.
 - Next.js reads `PORT`, so `next dev` or a workspace `dev` script works unchanged. Vite needs `vite --port "$APP_PORT" --strictPort`. Prefer strict port flags: a server that silently moves to another port would leave you testing someone else's app, and `serve` fails in that case.
 - `chrome` starts a dedicated headless Chrome with its own throwaway profile on `CDP_PORT`. Add `--headed` to watch it.
 - Next.js 16 dev mode can change tracked files: it points `next-env.d.ts` at `.next/dev/types`, and when it detects an agent it writes `AGENTS.md` and `CLAUDE.md` into the app unless `next.config` sets `agentRules: false`. Do not commit those changes unless they are intended.
@@ -54,16 +54,16 @@ agent-browser open "$APP_URL"
 
 Electron must enable CDP at launch and needs its own user data directory per lane, so lanes neither share storage nor collide as a second instance of the same app.
 
-When you own the app code, add this to the main process before `app.whenReady()` and before any `requestSingleInstanceLock()` call. The environment gate keeps packaged builds from opening a debugging port.
+When you own the app code, add this to the main process before `app.whenReady()` and before any `requestSingleInstanceLock()` call. The `app.isPackaged` check keeps shipped builds from opening a debugging port even if `CDP_PORT` happens to be set in a user's environment.
 
 ```js
 const fs = require('node:fs');
 const { app } = require('electron');
 
-if (process.env.CDP_PORT) {
+if (!app.isPackaged && process.env.CDP_PORT) {
   app.commandLine.appendSwitch('remote-debugging-port', process.env.CDP_PORT);
 }
-if (process.env.ELECTRON_USER_DATA_DIR) {
+if (!app.isPackaged && process.env.ELECTRON_USER_DATA_DIR) {
   fs.mkdirSync(process.env.ELECTRON_USER_DATA_DIR, { recursive: true });
   app.setPath('userData', process.env.ELECTRON_USER_DATA_DIR);
 }
@@ -111,7 +111,7 @@ agent-browser screenshot "$LANE_DIR/after.png"
 python3 <skill-dir>/scripts/lane.py stop
 ```
 
-`stop` closes the lane's agent-browser session, then terminates only the process groups the lane started, after confirming each recorded PID still belongs to the same process. It keeps the port claim so the worktree gets the same ports next time. Add `--release` to drop the claim and delete the lane's throwaway profiles and logs; Chrome and Electron profiles can reach hundreds of megabytes, so release lanes you no longer need.
+`stop` closes the lane's agent-browser session, then terminates only the process groups the lane started, after confirming each recorded leader PID still belongs to the same process. If a leader exited but its group lives on, `stop` lists the leftovers and signals nothing; check them, then use `stop --force`. It keeps the port claim so the worktree gets the same ports next time. Add `--release` to drop the claim and delete the lane's throwaway profiles and logs; Chrome and Electron profiles can reach hundreds of megabytes, so release lanes you no longer need.
 
 ## Inspecting lanes
 
@@ -121,7 +121,7 @@ python3 <skill-dir>/scripts/lane.py stop
 
 ## Remote hosts and CI
 
-The same commands work on Linux. Install a browser with `agent-browser install --with-deps` or set `AGENT_BROWSER_EXECUTABLE_PATH` or `CHROME_PATH`. The dedicated Chrome is headless by default and adds `--no-sandbox` only when running as root on Linux.
+The same commands work on Linux. `lane.py chrome` looks for `google-chrome`, `google-chrome-stable`, `chromium`, or `chromium-browser` on `PATH`; for any other install, including a browser downloaded by `agent-browser install`, set `AGENT_BROWSER_EXECUTABLE_PATH` or `CHROME_PATH` to the binary. Install `lsof` (or keep `ss` from iproute2) so the lane can verify who owns its ports. The dedicated Chrome is headless by default and adds `--no-sandbox` only when running as root on Linux.
 
 ## Troubleshooting
 
