@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
-"""Per-worktree test lanes for parallel agents.
+"""Splitscreen: give every coding agent its own screen of your app.
 
-A lane binds one worktree to one app port, one CDP port, one agent-browser
-session, and the processes the lane starts. Lanes never share ports, so
-parallel agents cannot drive each other's app. See ../SKILL.md.
+A screen binds one worktree to one app port, one CDP port, one agent-browser
+session, and the processes it starts. Screens never share ports, so parallel
+agents cannot drive each other's app. See ../SKILL.md.
 """
 
 from __future__ import annotations
@@ -27,16 +27,16 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Callable, Dict, Iterator, List, NoReturn, Optional, Set, Tuple
 
-APP_BASE = int(os.environ.get("PARALLEL_APP_TESTING_APP_BASE", "4100"))
-CDP_BASE = int(os.environ.get("PARALLEL_APP_TESTING_CDP_BASE", "9300"))
-SLOTS = int(os.environ.get("PARALLEL_APP_TESTING_SLOTS", "400"))
-LANE_ID = re.compile(r"[0-9a-f]{12}")
+APP_BASE = int(os.environ.get("SPLITSCREEN_APP_BASE", "4100"))
+CDP_BASE = int(os.environ.get("SPLITSCREEN_CDP_BASE", "9300"))
+SLOTS = int(os.environ.get("SPLITSCREEN_SLOTS", "400"))
+SCREEN_ID = re.compile(r"[0-9a-f]{12}")
 # Local requests must not go through HTTP_PROXY or similar settings.
 DIRECT = urllib.request.build_opener(urllib.request.ProxyHandler({}))
 
 
 def fail(message: str, code: int = 1) -> NoReturn:
-    print(f"lane: {message}", file=sys.stderr)
+    print(f"splitscreen: {message}", file=sys.stderr)
     sys.exit(code)
 
 
@@ -46,7 +46,7 @@ def now_iso() -> str:
 
 def validate_config() -> None:
     if SLOTS < 1:
-        fail("PARALLEL_APP_TESTING_SLOTS must be at least 1")
+        fail("SPLITSCREEN_SLOTS must be at least 1")
     for name, base in (("APP", APP_BASE), ("CDP", CDP_BASE)):
         if base < 1024 or base + SLOTS - 1 > 65535:
             fail(f"{name} ports {base}-{base + SLOTS - 1} fall outside 1024-65535")
@@ -58,19 +58,19 @@ def validate_config() -> None:
 
 
 def state_home() -> Path:
-    override = os.environ.get("PARALLEL_APP_TESTING_HOME")
+    override = os.environ.get("SPLITSCREEN_HOME")
     if override:
         return Path(override).expanduser()
     base = os.environ.get("XDG_STATE_HOME") or str(Path.home() / ".local" / "state")
-    return Path(base) / "parallel-app-testing"
+    return Path(base) / "splitscreen"
 
 
-def lanes_dir() -> Path:
-    return state_home() / "lanes"
+def screens_dir() -> Path:
+    return state_home() / "screens"
 
 
-def lane_dir(lane: dict) -> Path:
-    return lanes_dir() / lane["id"]
+def screen_dir(screen: dict) -> Path:
+    return screens_dir() / screen["id"]
 
 
 @contextlib.contextmanager
@@ -85,8 +85,8 @@ def registry_lock() -> Iterator[None]:
             fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
 
 
-def load_lane(lane_id: str) -> Optional[dict]:
-    path = lanes_dir() / lane_id / "lane.json"
+def load_screen(screen_id: str) -> Optional[dict]:
+    path = screens_dir() / screen_id / "screen.json"
     try:
         return json.loads(path.read_text(encoding="utf-8"))
     except FileNotFoundError:
@@ -95,31 +95,31 @@ def load_lane(lane_id: str) -> Optional[dict]:
         fail(f"cannot read {path}: {error}")
 
 
-def load_all_lanes() -> Dict[str, dict]:
-    lanes: Dict[str, dict] = {}
-    base = lanes_dir()
+def load_all_screens() -> Dict[str, dict]:
+    screens: Dict[str, dict] = {}
+    base = screens_dir()
     if not base.is_dir():
-        return lanes
+        return screens
     for entry in sorted(base.iterdir()):
-        if LANE_ID.fullmatch(entry.name) and (entry / "lane.json").is_file():
-            lane = load_lane(entry.name)
-            if lane is not None:
-                lanes[entry.name] = lane
-    return lanes
+        if SCREEN_ID.fullmatch(entry.name) and (entry / "screen.json").is_file():
+            screen = load_screen(entry.name)
+            if screen is not None:
+                screens[entry.name] = screen
+    return screens
 
 
-def save_lane(lane: dict) -> None:
-    directory = lane_dir(lane)
+def save_screen(screen: dict) -> None:
+    directory = screen_dir(screen)
     directory.mkdir(parents=True, exist_ok=True)
-    staging = directory / "lane.json.tmp"
-    staging.write_text(json.dumps(lane, indent=2, sort_keys=True) + "\n", encoding="utf-8")
-    os.replace(staging, directory / "lane.json")
+    staging = directory / "screen.json.tmp"
+    staging.write_text(json.dumps(screen, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    os.replace(staging, directory / "screen.json")
 
 
 @contextlib.contextmanager
-def launch_lock(lane: dict) -> Iterator[None]:
-    """Serialize starting and stopping processes within one lane."""
-    directory = lane_dir(lane)
+def launch_lock(screen: dict) -> Iterator[None]:
+    """Serialize starting and stopping processes within one screen."""
+    directory = screen_dir(screen)
     directory.mkdir(parents=True, exist_ok=True)
     with open(directory / "launch.lock", "a+", encoding="utf-8") as handle:
         fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
@@ -129,22 +129,22 @@ def launch_lock(lane: dict) -> Iterator[None]:
             fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
 
 
-def update_processes(lane: dict, name: str, record: Optional[dict]) -> None:
-    """Set or remove one process record, merging with the latest saved lane."""
+def update_processes(screen: dict, name: str, record: Optional[dict]) -> None:
+    """Set or remove one process record, merging with the latest saved screen."""
     with registry_lock():
-        fresh = load_lane(lane["id"]) or lane
+        fresh = load_screen(screen["id"]) or screen
         processes = fresh.setdefault("processes", {})
         if record is None:
             processes.pop(name, None)
         else:
             processes[name] = record
-        save_lane(fresh)
-    lane["processes"] = fresh["processes"]
+        save_screen(fresh)
+    screen["processes"] = fresh["processes"]
 
 
-def remove_lane_dir(lane_id: str) -> None:
-    target = lanes_dir() / lane_id
-    if not LANE_ID.fullmatch(lane_id) or target.parent != lanes_dir():
+def remove_screen_dir(screen_id: str) -> None:
+    target = screens_dir() / screen_id
+    if not SCREEN_ID.fullmatch(screen_id) or target.parent != screens_dir():
         fail(f"refusing to remove unexpected path {target}")
     shutil.rmtree(target, ignore_errors=False)
 
@@ -168,11 +168,11 @@ def resolve_root(explicit: Optional[str]) -> Path:
     return start.resolve()
 
 
-def lane_id_for(root: Path) -> str:
+def screen_id_for(root: Path) -> str:
     return hashlib.sha256(str(root).encode("utf-8")).hexdigest()[:12]
 
 
-def session_for(root: Path, lane_id: str) -> str:
+def session_for(root: Path, screen_id: str) -> str:
     # The branch tells worktrees apart when they share a folder name.
     label = root.name
     try:
@@ -185,7 +185,7 @@ def session_for(root: Path, lane_id: str) -> str:
     if branch:
         label = branch
     slug = re.sub(r"[^a-z0-9]+", "-", label.lower()).strip("-")[:24].strip("-")
-    return f"lane-{slug or 'root'}-{lane_id[:6]}"
+    return f"screen-{slug or 'root'}-{screen_id[:6]}"
 
 
 # Ports ----------------------------------------------------------------------
@@ -314,9 +314,9 @@ def record_state(record: dict) -> str:
     return "running"
 
 
-def lane_has_live_process(lane: dict) -> bool:
+def screen_has_live_process(screen: dict) -> bool:
     return any(
-        record_state(record) in ("running", "unverified") for record in lane.get("processes", {}).values()
+        record_state(record) in ("running", "unverified") for record in screen.get("processes", {}).values()
     )
 
 
@@ -356,7 +356,7 @@ def owned_by_group(port: int, pgid: int) -> Optional[bool]:
 
     Returns None when no tool can list listeners. No visible listener on a
     listening port means its owner is a process this user cannot inspect,
-    which is never one the lane started.
+    which is never one the screen started.
     """
     pids = listener_pids(port)
     if pids is None:
@@ -374,15 +374,15 @@ def tail(path: str, lines: int = 30) -> str:
     return "\n".join(data.decode("utf-8", "replace").splitlines()[-lines:])
 
 
-# Lanes ----------------------------------------------------------------------
+# Screens ----------------------------------------------------------------------
 
 
-def claim_is_active(lane: dict) -> bool:
-    return Path(lane["root"]).exists() or lane_has_live_process(lane)
+def claim_is_active(screen: dict) -> bool:
+    return Path(screen["root"]).exists() or screen_has_live_process(screen)
 
 
-def pick_slot(lane_id: str, taken: Set[int]) -> int:
-    start = int(lane_id, 16) % SLOTS
+def pick_slot(screen_id: str, taken: Set[int]) -> int:
+    start = int(screen_id, 16) % SLOTS
     for offset in range(SLOTS):
         slot = (start + offset) % SLOTS
         if slot in taken:
@@ -390,74 +390,74 @@ def pick_slot(lane_id: str, taken: Set[int]) -> int:
         app_port, cdp_port = slot_ports(slot)
         if port_free(app_port) and port_free(cdp_port):
             return slot
-    fail(f"no free lane among {SLOTS} slots; run `lane.py list --prune` or stop idle lanes")
+    fail(f"no free screen among {SLOTS} slots; run `splitscreen.py list --prune` or stop idle screens")
 
 
-def claim_lane(root: Path, move: bool = False) -> dict:
-    """Return this worktree's lane, creating it on first use.
+def claim_screen(root: Path, move: bool = False) -> dict:
+    """Return this worktree's screen, creating it on first use.
 
-    An existing lane keeps its slot even when its ports are busy, because the
+    An existing screen keeps its slot even when its ports are busy, because the
     usual owner is this agent's own server. Use move=True to pick a new slot.
     """
-    lane_id = lane_id_for(root)
+    screen_id = screen_id_for(root)
     with registry_lock():
-        lanes = load_all_lanes()
+        screens = load_all_screens()
         taken = {
-            lane["slot"] for other_id, lane in lanes.items()
-            if other_id != lane_id and claim_is_active(lane)
+            screen["slot"] for other_id, screen in screens.items()
+            if other_id != screen_id and claim_is_active(screen)
         }
-        mine = lanes.get(lane_id)
+        mine = screens.get(screen_id)
         if mine is not None and not move and 0 <= mine["slot"] < SLOTS and mine["slot"] not in taken:
             app_port, cdp_port = slot_ports(mine["slot"])
             if (mine["app_port"], mine["cdp_port"]) != (app_port, cdp_port):
-                if lane_has_live_process(mine):
+                if screen_has_live_process(mine):
                     # Its processes are bound to the recorded ports; moving the numbers would orphan them.
-                    print(f"lane: note: keeping ports {mine['app_port']}/{mine['cdp_port']} while processes run; "
-                          "stop the lane to apply the new port bases", file=sys.stderr)
+                    print(f"splitscreen: note: keeping ports {mine['app_port']}/{mine['cdp_port']} while processes run; "
+                          "stop the screen to apply the new port bases", file=sys.stderr)
                 else:
                     mine["app_port"], mine["cdp_port"] = app_port, cdp_port
-                    save_lane(mine)
+                    save_screen(mine)
             return mine
-        if mine is not None and lane_has_live_process(mine):
-            fail("this lane still has running processes; run `lane.py stop` before moving it")
+        if mine is not None and screen_has_live_process(mine):
+            fail("this screen still has running processes; run `splitscreen.py stop` before moving it")
         if mine is not None:
             taken.add(mine["slot"])
-        slot = pick_slot(lane_id, taken)
+        slot = pick_slot(screen_id, taken)
         app_port, cdp_port = slot_ports(slot)
-        lane = {
-            "id": lane_id,
+        screen = {
+            "id": screen_id,
             "root": str(root),
             "slot": slot,
             "app_port": app_port,
             "cdp_port": cdp_port,
-            "session": session_for(root, lane_id),
+            "session": session_for(root, screen_id),
             "created_at": now_iso(),
             "processes": {},
         }
-        save_lane(lane)
-        return lane
+        save_screen(screen)
+        return screen
 
 
-def lane_values(lane: dict) -> Dict[str, str]:
-    directory = lane_dir(lane)
+def screen_values(screen: dict) -> Dict[str, str]:
+    directory = screen_dir(screen)
     return {
-        "LANE_ROOT": lane["root"],
-        "LANE_DIR": str(directory),
-        "APP_PORT": str(lane["app_port"]),
-        "CDP_PORT": str(lane["cdp_port"]),
-        "APP_URL": f"http://localhost:{lane['app_port']}",
-        "AGENT_BROWSER_SESSION": lane["session"],
+        "SCREEN_ROOT": screen["root"],
+        "SCREEN_DIR": str(directory),
+        "APP_PORT": str(screen["app_port"]),
+        "CDP_PORT": str(screen["cdp_port"]),
+        "APP_URL": f"http://localhost:{screen['app_port']}",
+        "AGENT_BROWSER_SESSION": screen["session"],
         "ELECTRON_USER_DATA_DIR": str(directory / "electron-user-data"),
     }
 
 
-def launch(lane: dict, name: str, argv: List[str], display: str) -> Tuple[subprocess.Popen, dict]:
-    directory = lane_dir(lane)
+def launch(screen: dict, name: str, argv: List[str], display: str) -> Tuple[subprocess.Popen, dict]:
+    directory = screen_dir(screen)
     (directory / "electron-user-data").mkdir(parents=True, exist_ok=True)
     log_path = directory / f"{name}.log"
     env = dict(os.environ)
-    env.update(lane_values(lane))
-    env["PORT"] = str(lane["app_port"])
+    env.update(screen_values(screen))
+    env["PORT"] = str(screen["app_port"])
     with open(log_path, "ab") as log:
         log.write(f"\n--- {now_iso()} {name}: {display}\n".encode("utf-8"))
         log.flush()
@@ -484,7 +484,7 @@ def launch(lane: dict, name: str, argv: List[str], display: str) -> Tuple[subpro
         "started_at": now_iso(),
     }
     try:
-        update_processes(lane, name, record)
+        update_processes(screen, name, record)
     except (OSError, SystemExit) as error:
         # Without a saved record nothing could stop this group later.
         terminate_group(process.pid)
@@ -505,58 +505,58 @@ def wait_ready(process: Optional[subprocess.Popen], record: dict, ready: Callabl
     return ready()
 
 
-def stop_process(lane: dict, name: str, force: bool = False) -> Tuple[bool, str]:
-    record = lane.get("processes", {}).get(name)
+def stop_process(screen: dict, name: str, force: bool = False) -> Tuple[bool, str]:
+    record = screen.get("processes", {}).get(name)
     if record is None:
-        return True, f"{name}: not started by this lane"
+        return True, f"{name}: not started by this screen"
     state = record_state(record)
     if state == "foreign":
-        update_processes(lane, name, None)
+        update_processes(screen, name, None)
         return True, f"{name}: PID {record['pid']} now belongs to another process; left it running"
     if state == "stopped":
-        update_processes(lane, name, None)
+        update_processes(screen, name, None)
         return True, f"{name}: already stopped"
     if state == "unverified" and not force:
         members = "; ".join(f"PID {pid} {command[:80]}" for pid, command in group_members(record["pgid"]))
         return False, (
             f"{name}: leader PID {record['pid']} is gone but process group {record['pgid']} is still alive "
             f"({members or 'no members listed'}). Ownership cannot be verified, so nothing was signaled. "
-            "If these are your processes, run `lane.py stop --force`."
+            "If these are your processes, run `splitscreen.py stop --force`."
         )
     if not terminate_group(record["pgid"]):
         return False, f"{name}: process group {record['pgid']} did not exit"
-    update_processes(lane, name, None)
+    update_processes(screen, name, None)
     return True, f"{name}: stopped PID {record['pid']}"
 
 
 def reject_busy(port: int, role: str) -> NoReturn:
     fail(
         f"{role} port {port} is in use{describe_listeners(port)}. Do not kill it. If it is your own "
-        "server started outside lane.py, stop it or keep using it; otherwise run `lane.py env --move`.",
+        "server started outside splitscreen.py, stop it or keep using it; otherwise run `splitscreen.py env --move`.",
         code=2,
     )
 
 
-def require_owner(lane: dict, name: str, record: dict, port: int, launched: bool) -> None:
+def require_owner(screen: dict, name: str, record: dict, port: int, launched: bool) -> None:
     owner = owned_by_group(port, record["pgid"])
     if owner is None:
-        print(f"lane: warning: cannot check who listens on port {port}; install lsof (or ss on Linux) "
-              "to verify it belongs to this lane", file=sys.stderr)
+        print(f"splitscreen: warning: cannot check who listens on port {port}; install lsof (or ss on Linux) "
+              "to verify it belongs to this screen", file=sys.stderr)
         return
     if owner:
         return
     held = describe_listeners(port) or " by a process this user cannot inspect"
     if launched:
-        failed_start(lane, name, record,
+        failed_start(screen, name, record,
                      f"did not bind port {port}; it is held{held}. The command may have moved to another port")
     fail(f"{name} is running as PID {record['pid']}, but port {port} is held{held}. "
-         "Run `lane.py stop`, then start it again")
+         "Run `splitscreen.py stop`, then start it again")
 
 
-def failed_start(lane: dict, name: str, record: dict, reason: str) -> NoReturn:
+def failed_start(screen: dict, name: str, record: dict, reason: str) -> NoReturn:
     output = tail(record["log"])
     # This invocation just launched the group, so it is known to be ours.
-    stop_process(lane, name, force=True)
+    stop_process(screen, name, force=True)
     if output:
         print(output, file=sys.stderr)
     fail(f"{name} {reason}; full log: {record['log']}")
@@ -585,7 +585,7 @@ def find_chrome() -> Optional[str]:
 
 
 def close_agent_browser(session: str) -> Tuple[bool, Optional[str]]:
-    """Close the lane's agent-browser session. Returns (succeeded, message)."""
+    """Close the screen's agent-browser session. Returns (succeeded, message)."""
     binary = shutil.which("agent-browser")
     if binary is None:
         return True, None
@@ -615,27 +615,27 @@ def close_agent_browser(session: str) -> Tuple[bool, Optional[str]]:
 
 def cmd_env(args: argparse.Namespace) -> int:
     root = resolve_root(args.root)
-    lane = claim_lane(root, move=args.move)
-    values = lane_values(lane)
+    screen = claim_screen(root, move=args.move)
+    values = screen_values(screen)
     if args.json:
         print(json.dumps(values, indent=2))
     else:
         for key, value in values.items():
             print(f"export {key}={shlex.quote(value)}")
-    if not lane_has_live_process(lane):
-        for role, port in (("app", lane["app_port"]), ("CDP", lane["cdp_port"])):
+    if not screen_has_live_process(screen):
+        for role, port in (("app", screen["app_port"]), ("CDP", screen["cdp_port"])):
             if port_listening(port):
                 print(
-                    f"lane: note: {role} port {port} is already in use{describe_listeners(port)}. "
-                    "If that is not your own server, run `lane.py env --move`.",
+                    f"splitscreen: note: {role} port {port} is already in use{describe_listeners(port)}. "
+                    "If that is not your own server, run `splitscreen.py env --move`.",
                     file=sys.stderr,
                 )
     return 0
 
 
 def cmd_serve(args: argparse.Namespace) -> int:
-    lane = claim_lane(resolve_root(args.root))
-    port = {"app": lane["app_port"], "cdp": lane["cdp_port"], "none": None}[args.wait]
+    screen = claim_screen(resolve_root(args.root))
+    port = {"app": screen["app_port"], "cdp": screen["cdp_port"], "none": None}[args.wait]
     if args.wait == "cdp":
         def ready() -> bool:
             return cdp_version(port) is not None
@@ -644,15 +644,15 @@ def cmd_serve(args: argparse.Namespace) -> int:
             return port is None or port_listening(port)
 
     process: Optional[subprocess.Popen] = None
-    with launch_lock(lane):
-        lane = load_lane(lane["id"]) or lane
-        existing = lane.get("processes", {}).get("serve")
+    with launch_lock(screen):
+        screen = load_screen(screen["id"]) or screen
+        existing = screen.get("processes", {}).get("serve")
         state = record_state(existing) if existing is not None else "stopped"
         if state == "unverified":
-            fail("an earlier serve group is still alive but unverified; check it with `lane.py status`, "
-                 "then run `lane.py stop --force`")
+            fail("an earlier serve group is still alive but unverified; check it with `splitscreen.py status`, "
+                 "then run `splitscreen.py stop --force`")
         if state == "running" and args.restart:
-            stopped, message = stop_process(lane, "serve")
+            stopped, message = stop_process(screen, "serve")
             print(message)
             if not stopped:
                 return 1
@@ -662,13 +662,13 @@ def cmd_serve(args: argparse.Namespace) -> int:
         else:
             if port is not None and not port_free(port):
                 reject_busy(port, args.wait)
-            process, record = launch(lane, "serve", ["/bin/sh", "-c", args.cmd], args.cmd)
+            process, record = launch(screen, "serve", ["/bin/sh", "-c", args.cmd], args.cmd)
 
     if process is None:
         if not wait_ready(None, record, ready, args.timeout):
             fail(f"serve is running as PID {record['pid']} but not ready; log {record['log']}")
         if port is not None:
-            require_owner(lane, "serve", record, port, launched=False)
+            require_owner(screen, "serve", record, port, launched=False)
         print(f"serve: already running and ready, PID {record['pid']}; log {record['log']}")
         return 0
     if port is None:
@@ -676,27 +676,27 @@ def cmd_serve(args: argparse.Namespace) -> int:
         return 0
     if not wait_ready(process, record, ready, args.timeout):
         if record_state(record) == "running":
-            failed_start(lane, "serve", record, f"was not ready on port {port} after {args.timeout:.0f}s")
-        failed_start(lane, "serve", record, "exited before it was ready")
-    require_owner(lane, "serve", record, port, launched=True)
-    target = lane_values(lane)["APP_URL"] if args.wait == "app" else f"CDP port {port}"
+            failed_start(screen, "serve", record, f"was not ready on port {port} after {args.timeout:.0f}s")
+        failed_start(screen, "serve", record, "exited before it was ready")
+    require_owner(screen, "serve", record, port, launched=True)
+    target = screen_values(screen)["APP_URL"] if args.wait == "app" else f"CDP port {port}"
     print(f"serve: ready at {target}, PID {record['pid']}; log {record['log']}")
     return 0
 
 
 def cmd_chrome(args: argparse.Namespace) -> int:
-    lane = claim_lane(resolve_root(args.root))
-    port = lane["cdp_port"]
+    screen = claim_screen(resolve_root(args.root))
+    port = screen["cdp_port"]
     process: Optional[subprocess.Popen] = None
-    with launch_lock(lane):
-        lane = load_lane(lane["id"]) or lane
-        existing = lane.get("processes", {}).get("chrome")
+    with launch_lock(screen):
+        screen = load_screen(screen["id"]) or screen
+        existing = screen.get("processes", {}).get("chrome")
         state = record_state(existing) if existing is not None else "stopped"
         if state == "unverified":
-            fail("an earlier chrome group is still alive but unverified; check it with `lane.py status`, "
-                 "then run `lane.py stop --force`")
+            fail("an earlier chrome group is still alive but unverified; check it with `splitscreen.py status`, "
+                 "then run `splitscreen.py stop --force`")
         if state == "running" and cdp_version(port) is None:
-            stopped, message = stop_process(lane, "chrome")
+            stopped, message = stop_process(screen, "chrome")
             print(message)
             if not stopped:
                 return 1
@@ -712,10 +712,10 @@ def cmd_chrome(args: argparse.Namespace) -> int:
             argv = [
                 binary,
                 f"--remote-debugging-port={port}",
-                f"--user-data-dir={lane_dir(lane) / 'chrome-profile'}",
+                f"--user-data-dir={screen_dir(screen) / 'chrome-profile'}",
                 "--no-first-run",
                 "--no-default-browser-check",
-                # Fewer background processes per lane; the same flags Puppeteer uses by default.
+                # Fewer background processes per screen; the same flags Puppeteer uses by default.
                 "--disable-background-networking",
                 "--disable-component-extensions-with-background-pages",
                 "--disable-default-apps",
@@ -726,17 +726,17 @@ def cmd_chrome(args: argparse.Namespace) -> int:
             if sys.platform.startswith("linux") and os.geteuid() == 0:
                 argv.append("--no-sandbox")
             argv.append("about:blank")
-            process, record = launch(lane, "chrome", argv, shlex.join(argv))
+            process, record = launch(screen, "chrome", argv, shlex.join(argv))
 
     if process is None:
-        require_owner(lane, "chrome", record, port, launched=False)
+        require_owner(screen, "chrome", record, port, launched=False)
         info = cdp_version(port) or {}
         print(f"chrome: already running on CDP port {port} ({info.get('Browser', '?')})")
         print(f"next: agent-browser connect {port}")
         return 0
     if not wait_ready(process, record, lambda: cdp_version(port) is not None, args.timeout):
-        failed_start(lane, "chrome", record, f"did not open CDP port {port} within {args.timeout:.0f}s")
-    require_owner(lane, "chrome", record, port, launched=True)
+        failed_start(screen, "chrome", record, f"did not open CDP port {port} within {args.timeout:.0f}s")
+    require_owner(screen, "chrome", record, port, launched=True)
     info = cdp_version(port) or {}
     print(f"chrome: ready on CDP port {port} ({info.get('Browser', '?')}), PID {record['pid']}")
     print(f"next: agent-browser connect {port}")
@@ -745,42 +745,42 @@ def cmd_chrome(args: argparse.Namespace) -> int:
 
 def cmd_stop(args: argparse.Namespace) -> int:
     root = resolve_root(args.root)
-    lane = load_lane(lane_id_for(root))
-    if lane is None:
-        print(f"no lane for {root}")
+    screen = load_screen(screen_id_for(root))
+    if screen is None:
+        print(f"no screen for {root}")
         return 0
-    ok, closed = close_agent_browser(lane["session"])
+    ok, closed = close_agent_browser(screen["session"])
     if closed:
         print(closed)
-    with launch_lock(lane):
-        lane = load_lane(lane["id"]) or lane
-        for name in list(lane.get("processes", {})):
-            stopped, message = stop_process(lane, name, force=args.force)
+    with launch_lock(screen):
+        screen = load_screen(screen["id"]) or screen
+        for name in list(screen.get("processes", {})):
+            stopped, message = stop_process(screen, name, force=args.force)
             ok = ok and stopped
             print(message)
     if args.release:
         if not ok:
-            fail("not releasing the lane while a process or browser session is still open")
+            fail("not releasing the screen while a process or browser session is still open")
         with registry_lock():
-            remove_lane_dir(lane["id"])
-        print(f"released lane {lane['session']} and deleted {lane_dir(lane)}")
+            remove_screen_dir(screen["id"])
+        print(f"released screen {screen['session']} and deleted {screen_dir(screen)}")
     return 0 if ok else 1
 
 
 def cmd_status(args: argparse.Namespace) -> int:
     root = resolve_root(args.root)
-    lane = load_lane(lane_id_for(root))
-    if lane is None:
-        print(f"no lane for {root}; claim one with: eval \"$(python3 {Path(__file__).resolve()} env)\"")
+    screen = load_screen(screen_id_for(root))
+    if screen is None:
+        print(f"no screen for {root}; claim one with: eval \"$(python3 {Path(__file__).resolve()} env)\"")
         return 1
-    print(f"lane     {lane['session']}  slot {lane['slot']}")
-    print(f"root     {lane['root']}")
-    app_state = "listening" if port_listening(lane["app_port"]) else "free"
-    print(f"app      {lane_values(lane)['APP_URL']}  {app_state}{describe_listeners(lane['app_port'])}")
-    info = cdp_version(lane["cdp_port"])
+    print(f"screen     {screen['session']}  slot {screen['slot']}")
+    print(f"root     {screen['root']}")
+    app_state = "listening" if port_listening(screen["app_port"]) else "free"
+    print(f"app      {screen_values(screen)['APP_URL']}  {app_state}{describe_listeners(screen['app_port'])}")
+    info = cdp_version(screen["cdp_port"])
     cdp_state = f"CDP up ({info.get('Browser', '?')})" if info else "no CDP endpoint"
-    print(f"cdp      {lane['cdp_port']}  {cdp_state}")
-    processes = lane.get("processes", {})
+    print(f"cdp      {screen['cdp_port']}  {cdp_state}")
+    processes = screen.get("processes", {})
     if not processes:
         print("process  none")
     for name, record in processes.items():
@@ -792,59 +792,59 @@ def cmd_list(args: argparse.Namespace) -> int:
     if args.prune:
         with registry_lock():
             # Decide from state read under the lock, not from an earlier snapshot.
-            for lane_id, lane in load_all_lanes().items():
-                if not Path(lane["root"]).exists() and not lane_has_live_process(lane):
-                    remove_lane_dir(lane_id)
-                    print(f"pruned {lane['session']} ({lane['root']})")
-    lanes = load_all_lanes()
-    if not lanes:
-        print("no lanes")
+            for screen_id, screen in load_all_screens().items():
+                if not Path(screen["root"]).exists() and not screen_has_live_process(screen):
+                    remove_screen_dir(screen_id)
+                    print(f"pruned {screen['session']} ({screen['root']})")
+    screens = load_all_screens()
+    if not screens:
+        print("no screens")
         return 0
-    for lane in sorted(lanes.values(), key=lambda item: item["slot"]):
-        running = [name for name, record in lane.get("processes", {}).items() if record_state(record) == "running"]
-        missing = "" if Path(lane["root"]).exists() else "  (worktree missing)"
+    for screen in sorted(screens.values(), key=lambda item: item["slot"]):
+        running = [name for name, record in screen.get("processes", {}).items() if record_state(record) == "running"]
+        missing = "" if Path(screen["root"]).exists() else "  (worktree missing)"
         print(
-            f"{lane['app_port']:>5} {lane['cdp_port']:>5}  {lane['session']:<36} "
-            f"{','.join(running) or '-':<14} {lane['root']}{missing}"
+            f"{screen['app_port']:>5} {screen['cdp_port']:>5}  {screen['session']:<36} "
+            f"{','.join(running) or '-':<14} {screen['root']}{missing}"
         )
     return 0
 
 
 def main(argv: Optional[List[str]] = None) -> int:
     validate_config()
-    parser = argparse.ArgumentParser(prog="lane.py", description=__doc__.splitlines()[0])
+    parser = argparse.ArgumentParser(prog="splitscreen.py", description=__doc__.splitlines()[0])
     parser.add_argument("--root", help="worktree path (default: the Git worktree of the current directory)")
     commands = parser.add_subparsers(dest="command", required=True)
 
-    env = commands.add_parser("env", help="claim this worktree's lane and print shell exports")
+    env = commands.add_parser("env", help="claim this worktree's screen and print shell exports")
     env.add_argument("--json", action="store_true", help="print JSON instead of export lines")
-    env.add_argument("--move", action="store_true", help="move the lane to a new slot with free ports")
+    env.add_argument("--move", action="store_true", help="move the screen to a new slot with free ports")
     env.set_defaults(handler=cmd_env)
 
     serve = commands.add_parser("serve", help="start the dev server or Electron app in the background")
-    serve.add_argument("--cmd", required=True, help="shell command; runs with PORT=$APP_PORT and lane variables")
+    serve.add_argument("--cmd", required=True, help="shell command; runs with PORT=$APP_PORT and screen variables")
     serve.add_argument("--wait", choices=("app", "cdp", "none"), default="app",
                        help="readiness check: app port (default), CDP endpoint (Electron), or none")
     serve.add_argument("--timeout", type=float, default=180.0, help="seconds to wait for readiness")
     serve.add_argument("--restart", action="store_true", help="stop the running server first")
     serve.set_defaults(handler=cmd_serve)
 
-    chrome = commands.add_parser("chrome", help="start a dedicated Chrome on this lane's CDP port")
+    chrome = commands.add_parser("chrome", help="start a dedicated Chrome on this screen's CDP port")
     chrome.add_argument("--headed", action="store_true", help="show the browser window")
     chrome.add_argument("--timeout", type=float, default=30.0, help="seconds to wait for the CDP endpoint")
     chrome.set_defaults(handler=cmd_chrome)
 
-    stop = commands.add_parser("stop", help="close the session and stop processes this lane started")
-    stop.add_argument("--release", action="store_true", help="also drop the port claim and delete lane files")
+    stop = commands.add_parser("stop", help="close the session and stop processes this screen started")
+    stop.add_argument("--release", action="store_true", help="also drop the port claim and delete screen files")
     stop.add_argument("--force", action="store_true",
                       help="also stop process groups whose leader exited, after you have checked them")
     stop.set_defaults(handler=cmd_stop)
 
-    status = commands.add_parser("status", help="show this worktree's lane")
+    status = commands.add_parser("status", help="show this worktree's screen")
     status.set_defaults(handler=cmd_status)
 
-    listing = commands.add_parser("list", help="show every lane on this machine")
-    listing.add_argument("--prune", action="store_true", help="drop lanes whose worktree no longer exists")
+    listing = commands.add_parser("list", help="show every screen on this machine")
+    listing.add_argument("--prune", action="store_true", help="drop screens whose worktree no longer exists")
     listing.set_defaults(handler=cmd_list)
 
     args = parser.parse_args(argv)
