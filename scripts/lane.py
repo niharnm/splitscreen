@@ -410,8 +410,13 @@ def claim_lane(root: Path, move: bool = False) -> dict:
         if mine is not None and not move and 0 <= mine["slot"] < SLOTS and mine["slot"] not in taken:
             app_port, cdp_port = slot_ports(mine["slot"])
             if (mine["app_port"], mine["cdp_port"]) != (app_port, cdp_port):
-                mine["app_port"], mine["cdp_port"] = app_port, cdp_port
-                save_lane(mine)
+                if lane_has_live_process(mine):
+                    # Its processes are bound to the recorded ports; moving the numbers would orphan them.
+                    print(f"lane: note: keeping ports {mine['app_port']}/{mine['cdp_port']} while processes run; "
+                          "stop the lane to apply the new port bases", file=sys.stderr)
+                else:
+                    mine["app_port"], mine["cdp_port"] = app_port, cdp_port
+                    save_lane(mine)
             return mine
         if mine is not None and lane_has_live_process(mine):
             fail("this lane still has running processes; run `lane.py stop` before moving it")
@@ -579,29 +584,30 @@ def find_chrome() -> Optional[str]:
     return None
 
 
-def close_agent_browser(session: str) -> Optional[str]:
+def close_agent_browser(session: str) -> Tuple[bool, Optional[str]]:
+    """Close the lane's agent-browser session. Returns (succeeded, message)."""
     binary = shutil.which("agent-browser")
     if binary is None:
-        return None
+        return True, None
     try:
         listing = subprocess.run(
             [binary, "session", "list", "--json"], capture_output=True, text=True, timeout=20, check=False,
         )
         sessions = json.loads(listing.stdout or "{}").get("data", {}).get("sessions", [])
     except (OSError, ValueError, subprocess.TimeoutExpired) as error:
-        return f"agent-browser: could not list sessions ({error})"
+        return False, f"agent-browser: could not list sessions ({error})"
     names = {entry if isinstance(entry, str) else entry.get("name") for entry in sessions}
     if session not in names:
-        return "agent-browser: no open session"
+        return True, "agent-browser: no open session"
     try:
         closing = subprocess.run(
             [binary, "--session", session, "close"], capture_output=True, text=True, timeout=30, check=False,
         )
     except (OSError, subprocess.TimeoutExpired) as error:
-        return f"agent-browser: close failed ({error})"
+        return False, f"agent-browser: close failed ({error})"
     if closing.returncode != 0:
-        return f"agent-browser: close exited {closing.returncode}: {closing.stderr.strip()[:200]}"
-    return f"agent-browser: closed session {session}"
+        return False, f"agent-browser: close exited {closing.returncode}: {closing.stderr.strip()[:200]}"
+    return True, f"agent-browser: closed session {session}"
 
 
 # Commands -------------------------------------------------------------------
@@ -743,8 +749,7 @@ def cmd_stop(args: argparse.Namespace) -> int:
     if lane is None:
         print(f"no lane for {root}")
         return 0
-    ok = True
-    closed = close_agent_browser(lane["session"])
+    ok, closed = close_agent_browser(lane["session"])
     if closed:
         print(closed)
     with launch_lock(lane):
@@ -755,7 +760,7 @@ def cmd_stop(args: argparse.Namespace) -> int:
             print(message)
     if args.release:
         if not ok:
-            fail("not releasing the lane while a process is still running")
+            fail("not releasing the lane while a process or browser session is still open")
         with registry_lock():
             remove_lane_dir(lane["id"])
         print(f"released lane {lane['session']} and deleted {lane_dir(lane)}")

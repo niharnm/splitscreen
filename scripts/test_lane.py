@@ -16,6 +16,7 @@ import tempfile
 import time
 import unittest
 from pathlib import Path
+from typing import Optional
 from unittest import mock
 
 SCRIPT = Path(__file__).resolve().parent / "lane.py"
@@ -71,9 +72,10 @@ class LaneTest(unittest.TestCase):
         })
         self.env.pop("AGENT_BROWSER_SESSION", None)
 
-    def run_lane(self, *args: str, cwd: Path, expect: int = 0, timeout: float = 90) -> subprocess.CompletedProcess:
+    def run_lane(self, *args: str, cwd: Path, expect: int = 0, timeout: float = 90,
+                 env: Optional[dict] = None) -> subprocess.CompletedProcess:
         result = subprocess.run(
-            [sys.executable, str(SCRIPT), *args], cwd=cwd, env=self.env,
+            [sys.executable, str(SCRIPT), *args], cwd=cwd, env=env or self.env,
             capture_output=True, text=True, timeout=timeout,
         )
         if result.returncode != expect:
@@ -325,6 +327,43 @@ class LaneTest(unittest.TestCase):
         self.assertIn(f"but port {port} is held", result.stderr)
         self.assertIsNone(sleeper.poll())
         self.run_lane("stop", cwd=root)
+
+    def test_running_lane_keeps_its_ports_when_bases_change(self) -> None:
+        root = self.make_root("rebased")
+        before = self.claim(root)
+        sleeper = subprocess.Popen(["sleep", "60"], start_new_session=True)
+        self.addCleanup(sleeper.wait)
+        self.addCleanup(kill_group, sleeper.pid)
+        self.write_record(root, "serve", {
+            "pid": sleeper.pid, "pgid": sleeper.pid, "start": lane_module.ps_field(sleeper.pid, "lstart"),
+        })
+        rebased = dict(self.env, PARALLEL_APP_TESTING_APP_BASE=str(self.app_base + 100))
+        running = self.run_lane("env", "--json", cwd=root, env=rebased)
+        self.assertEqual(json.loads(running.stdout)["APP_PORT"], before["APP_PORT"])
+        self.assertIn("keeping ports", running.stderr)
+        self.run_lane("stop", cwd=root)
+        idle = json.loads(self.run_lane("env", "--json", cwd=root, env=rebased).stdout)
+        self.assertEqual(int(idle["APP_PORT"]), int(before["APP_PORT"]) + 100)
+
+    def test_failed_session_close_fails_stop_and_blocks_release(self) -> None:
+        root = self.make_root("stuck-session")
+        session = self.claim(root)["AGENT_BROWSER_SESSION"]
+        bin_dir = self.tmp / "fake-bin"
+        bin_dir.mkdir()
+        fake = bin_dir / "agent-browser"
+        fake.write_text(
+            "#!/bin/sh\n"
+            f"if [ \"$1\" = session ]; then echo '{{\"data\":{{\"sessions\":[\"{session}\"]}}}}'; exit 0; fi\n"
+            "echo 'daemon did not answer' >&2\nexit 3\n",
+            encoding="utf-8",
+        )
+        fake.chmod(0o755)
+        broken = dict(self.env, PATH=f"{bin_dir}{os.pathsep}{self.env['PATH']}")
+        result = self.run_lane("stop", cwd=root, env=broken, expect=1)
+        self.assertIn("close exited 3", result.stdout)
+        blocked = self.run_lane("stop", "--release", cwd=root, env=broken, expect=1)
+        self.assertIn("not releasing", blocked.stderr)
+        self.assertTrue(self.lane_file(root).exists())
 
     @unittest.skipIf(lane_module.find_chrome() is None, "Chrome not installed")
     def test_dedicated_chrome_exposes_cdp_and_stops(self) -> None:
