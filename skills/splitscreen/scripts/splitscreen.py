@@ -209,16 +209,18 @@ def slot_ports(slot: int) -> Tuple[int, int]:
     return APP_BASE + slot, CDP_BASE + slot
 
 
+def port_accepts(port: int, host: str) -> bool:
+    family = socket.AF_INET6 if ":" in host else socket.AF_INET
+    try:
+        with socket.socket(family, socket.SOCK_STREAM) as probe:
+            probe.settimeout(0.3)
+            return probe.connect_ex((host, port)) == 0
+    except OSError:
+        return False
+
+
 def port_listening(port: int) -> bool:
-    for family, host in ((socket.AF_INET, "127.0.0.1"), (socket.AF_INET6, "::1")):
-        try:
-            with socket.socket(family, socket.SOCK_STREAM) as probe:
-                probe.settimeout(0.3)
-                if probe.connect_ex((host, port)) == 0:
-                    return True
-        except OSError:
-            continue
-    return False
+    return port_accepts(port, "127.0.0.1") or port_accepts(port, "::1")
 
 
 def port_bindable(port: int) -> bool:
@@ -234,20 +236,63 @@ def port_free(port: int) -> bool:
     return not port_listening(port) and port_bindable(port)
 
 
-def listener_pids(port: int) -> Optional[List[int]]:
-    """PIDs this user can see listening on the port, or None when no tool can list them."""
+def socket_family(kind: str, name: str) -> str:
+    """"4", "6", or "46" for an IPv6 wildcard socket, which also accepts IPv4."""
+    if kind == "IPv4":
+        return "4"
+    return "46" if name.rsplit(":", 1)[0] in ("*", "[::]") else "6"
+
+
+def listener_sockets(port: int) -> Optional[List[Tuple[Optional[int], str]]]:
+    """(pid or None, family) for each socket listening on the port.
+
+    lsof shows only sockets of processes this user can inspect. ss shows every
+    socket but leaves out the PID of other users' processes. None means
+    neither tool is installed.
+    """
     if shutil.which("lsof"):
         probe = subprocess.run(
-            ["lsof", "-nP", f"-iTCP:{port}", "-sTCP:LISTEN", "-t"],
+            ["lsof", "-nP", f"-iTCP:{port}", "-sTCP:LISTEN", "-F", "ptn"],
             capture_output=True, text=True, check=False,
         )
-        return sorted({int(token) for token in probe.stdout.split() if token.isdigit()})
+        sockets: List[Tuple[Optional[int], str]] = []
+        pid: Optional[int] = None
+        kind = ""
+        for line in probe.stdout.splitlines():
+            tag, value = line[:1], line[1:]
+            if tag == "p":
+                pid = int(value)
+            elif tag == "t":
+                kind = value
+            elif tag == "n":
+                sockets.append((pid, socket_family(kind, value)))
+        return sockets
     if shutil.which("ss"):
         probe = subprocess.run(
             ["ss", "-Hltnp", "sport", "=", f":{port}"], capture_output=True, text=True, check=False,
         )
-        return sorted({int(pid) for pid in re.findall(r"pid=(\d+)", probe.stdout)})
+        sockets = []
+        for line in probe.stdout.splitlines():
+            fields = line.split()
+            if len(fields) < 4:
+                continue
+            local = fields[3]
+            family = socket_family("IPv6" if local.startswith(("[", "*")) else "IPv4", local)
+            pids = [int(found) for found in re.findall(r"pid=(\d+)", line)]
+            if pids:
+                sockets.extend((found, family) for found in pids)
+            else:
+                sockets.append((None, family))
+        return sockets
     return None
+
+
+def listener_pids(port: int) -> Optional[List[int]]:
+    """PIDs listening on the port that this user can see, or None when no tool can list them."""
+    sockets = listener_sockets(port)
+    if sockets is None:
+        return None
+    return sorted({pid for pid, _ in sockets if pid is not None})
 
 
 def describe_listeners(port: int) -> str:
@@ -366,18 +411,27 @@ def terminate_group(pgid: int) -> bool:
 
 
 def owned_by_group(port: int, pgid: int) -> Optional[bool]:
-    """Whether every listener on the port is in the process group.
+    """Whether the process group owns every listener on the port.
 
-    Returns None when no tool can list listeners. No visible listener on a
-    listening port means its owner is a process this user cannot inspect,
-    which is never one the screen started.
+    Returns None when no tool can list listeners. A socket without a visible
+    PID belongs to a process this user cannot inspect. A loopback address that
+    accepts connections with no owned socket of that family behind it means a
+    listener this user cannot see, for example another user's IPv6 socket
+    next to this screen's IPv4 one.
     """
-    pids = listener_pids(port)
-    if pids is None:
+    sockets = listener_sockets(port)
+    if sockets is None:
         return None
-    if not pids:
-        return False if port_listening(port) else None
-    return all(ps_field(pid, "pgid") == str(pgid) for pid in pids)
+    families = set()
+    for pid, family in sockets:
+        if pid is None or ps_field(pid, "pgid") != str(pgid):
+            return False
+        families.add(family)
+    if port_accepts(port, "127.0.0.1") and not families & {"4", "46"}:
+        return False
+    if port_accepts(port, "::1") and not families & {"6", "46"}:
+        return False
+    return bool(families)
 
 
 def tail(path: str, lines: int = 30) -> str:
@@ -555,9 +609,10 @@ def reject_busy(port: int, role: str) -> NoReturn:
 def require_owner(screen: dict, name: str, record: dict, port: int, launched: bool) -> None:
     owner = owned_by_group(port, record["pgid"])
     if owner is None:
-        print(f"splitscreen: warning: cannot check who listens on port {port}; install lsof (or ss on Linux) "
-              "to verify it belongs to this screen", file=sys.stderr)
-        return
+        reason = f"cannot check who listens on port {port}; install lsof, or ss from iproute2 on Linux"
+        if launched:
+            failed_start(screen, name, record, reason)
+        fail(reason)
     if owner:
         return
     held = describe_listeners(port) or " by a process this user cannot inspect"

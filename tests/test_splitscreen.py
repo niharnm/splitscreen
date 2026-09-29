@@ -311,18 +311,49 @@ class ScreenTest(unittest.TestCase):
         self.assertEqual(stdout.count("already running and ready"), 1, stdout)
         self.assertTrue(listening(port))
 
-    def test_owner_check_requires_every_listener(self) -> None:
-        with mock.patch.object(screen_module, "listener_pids", return_value=[11, 12]), \
-                mock.patch.object(screen_module, "ps_field", side_effect=lambda pid, field: {11: "500", 12: "999"}[pid]):
-            self.assertFalse(screen_module.owned_by_group(4000, 500))
-        with mock.patch.object(screen_module, "listener_pids", return_value=[11, 12]), \
-                mock.patch.object(screen_module, "ps_field", return_value="500"):
-            self.assertTrue(screen_module.owned_by_group(4000, 500))
-        with mock.patch.object(screen_module, "listener_pids", return_value=[]), \
-                mock.patch.object(screen_module, "port_listening", return_value=True):
-            self.assertFalse(screen_module.owned_by_group(4000, 500))
-        with mock.patch.object(screen_module, "listener_pids", return_value=None):
-            self.assertIsNone(screen_module.owned_by_group(4000, 500))
+    def owner(self, sockets, groups=None, accepts=("127.0.0.1",)) -> Optional[bool]:
+        groups = groups or {}
+        with mock.patch.object(screen_module, "listener_sockets", return_value=sockets), \
+                mock.patch.object(screen_module, "ps_field", side_effect=lambda pid, field: groups.get(pid, "500")), \
+                mock.patch.object(screen_module, "port_accepts", side_effect=lambda port, host: host in accepts):
+            return screen_module.owned_by_group(4000, 500)
+
+    def test_owner_check_requires_every_listener_and_address_family(self) -> None:
+        self.assertTrue(self.owner([(11, "4"), (12, "4")]))
+        self.assertFalse(self.owner([(11, "4"), (12, "4")], groups={12: "999"}))
+        self.assertFalse(self.owner([(11, "4"), (None, "6")]))
+        # An IPv6 listener this user cannot see answers next to the screen's IPv4 socket.
+        self.assertFalse(self.owner([(11, "4")], accepts=("127.0.0.1", "::1")))
+        self.assertTrue(self.owner([(11, "46")], accepts=("127.0.0.1", "::1")))
+        self.assertFalse(self.owner([], accepts=("127.0.0.1",)))
+        self.assertIsNone(self.owner(None))
+
+    def test_listener_parsing_for_lsof_and_ss(self) -> None:
+        lsof_output = "p123\nf20\ntIPv6\nn*:4000\np456\nf7\ntIPv4\nn127.0.0.1:4000\nf8\ntIPv6\nn[::1]:4000\n"
+        with mock.patch.object(screen_module.shutil, "which", side_effect=lambda name: "/bin/x" if name == "lsof" else None), \
+                mock.patch.object(screen_module.subprocess, "run",
+                                  return_value=subprocess.CompletedProcess([], 0, lsof_output, "")):
+            self.assertEqual(screen_module.listener_sockets(4000), [(123, "46"), (456, "4"), (456, "6")])
+        ss_output = (
+            'LISTEN 0 511 [::]:4000 [::]:* users:(("node",pid=123,fd=20))\n'
+            "LISTEN 0 128 127.0.0.1:4000 0.0.0.0:*\n"
+        )
+        with mock.patch.object(screen_module.shutil, "which", side_effect=lambda name: "/bin/x" if name == "ss" else None), \
+                mock.patch.object(screen_module.subprocess, "run",
+                                  return_value=subprocess.CompletedProcess([], 0, ss_output, "")):
+            self.assertEqual(screen_module.listener_sockets(4000), [(123, "46"), (None, "4")])
+
+    def test_serve_fails_closed_without_a_listener_tool(self) -> None:
+        root = self.make_root("no-lsof")
+        self.claim(root)
+        bin_dir = self.tmp / "minimal-bin"
+        bin_dir.mkdir()
+        for tool in ("ps", "sh"):
+            (bin_dir / tool).symlink_to(shutil.which(tool))
+        minimal = dict(self.env, PATH=str(bin_dir))
+        result = self.run_cli("serve", "--cmd", self.serve_cmd, "--timeout", "20", cwd=root, env=minimal, expect=1)
+        self.assertIn("cannot check who listens", result.stderr)
+        self.assertEqual(json.loads(self.screen_file(root).read_text(encoding="utf-8"))["processes"], {})
 
     @unittest.skipIf(screen_module.listener_pids(1) is None, "no lsof or ss to list listeners")
     def test_running_server_must_still_own_its_port(self) -> None:
