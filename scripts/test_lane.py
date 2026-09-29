@@ -35,6 +35,23 @@ def kill_group(pid: int) -> None:
         pass
 
 
+def group_is_alive(pgid: int) -> bool:
+    try:
+        os.killpg(pgid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    return True
+
+
+def wait_for_group_exit(pgid: int, seconds: float = 5) -> bool:
+    deadline = time.monotonic() + seconds
+    while group_is_alive(pgid) and time.monotonic() < deadline:
+        time.sleep(0.1)
+    return not group_is_alive(pgid)
+
+
 class LaneTest(unittest.TestCase):
     slots = 4
 
@@ -208,6 +225,54 @@ class LaneTest(unittest.TestCase):
         listing = self.run_lane("list", "--prune", cwd=self.tmp)
         self.assertIn("pruned", listing.stdout)
         self.assertFalse(lane_path.parent.exists())
+
+    def write_record(self, root: Path, name: str, record: dict) -> None:
+        lane_path = self.lane_file(root)
+        lane = json.loads(lane_path.read_text(encoding="utf-8"))
+        lane["processes"][name] = {
+            "cmd": "test", "cwd": str(root), "log": str(lane_path.parent / f"{name}.log"),
+            "started_at": "2001-01-01T00:00:00+00:00", **record,
+        }
+        lane_path.write_text(json.dumps(lane), encoding="utf-8")
+
+    def test_stop_needs_force_when_the_group_leader_is_gone(self) -> None:
+        root = self.make_root("orphans")
+        self.claim(root)
+        leader = subprocess.Popen(["/bin/sh", "-c", "sleep 60 & exit 0"], start_new_session=True)
+        leader.wait()
+        self.addCleanup(kill_group, leader.pid)
+        self.write_record(root, "serve", {"pid": leader.pid, "pgid": leader.pid, "start": "Mon Jan  1 00:00:00 2001"})
+        refused = self.run_lane("stop", cwd=root, expect=1)
+        self.assertIn("Ownership cannot be verified", refused.stdout)
+        self.assertTrue(group_is_alive(leader.pid))
+        self.run_lane("stop", "--force", cwd=root)
+        self.assertTrue(wait_for_group_exit(leader.pid))
+
+    def test_record_without_a_start_time_is_not_trusted(self) -> None:
+        root = self.make_root("no-start")
+        self.claim(root)
+        sleeper = subprocess.Popen(["sleep", "60"], start_new_session=True)
+        self.addCleanup(sleeper.wait)
+        self.addCleanup(kill_group, sleeper.pid)
+        self.write_record(root, "serve", {"pid": sleeper.pid, "pgid": sleeper.pid, "start": None})
+        self.run_lane("stop", cwd=root, expect=1)
+        self.assertIsNone(sleeper.poll())
+
+    @unittest.skipIf(os.geteuid() == 0, "root ignores directory permissions")
+    def test_failed_state_write_stops_the_new_process(self) -> None:
+        root = self.make_root("read-only-state")
+        self.claim(root)
+        directory = self.lane_file(root).parent
+        (directory / "serve.log").touch()
+        (directory / "electron-user-data").mkdir(exist_ok=True)
+        (directory / "launch.lock").touch()
+        directory.chmod(0o500)
+        self.addCleanup(directory.chmod, 0o700)
+        marker = f"{random.randrange(10 ** 6)}.25"
+        result = self.run_lane("serve", "--wait", "none", "--cmd", f"exec sleep {marker}", cwd=root, expect=1)
+        self.assertIn("could not record serve", result.stderr)
+        leftover = subprocess.run(["pgrep", "-f", f"sleep {marker}"], capture_output=True, text=True)
+        self.assertEqual(leftover.stdout.strip(), "")
 
     @unittest.skipIf(lane_module.find_chrome() is None, "Chrome not installed")
     def test_dedicated_chrome_exposes_cdp_and_stops(self) -> None:

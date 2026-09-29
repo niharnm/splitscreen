@@ -269,22 +269,39 @@ def group_alive(pgid: int) -> bool:
 
 
 def record_state(record: dict) -> str:
-    """Return running, stopped, or foreign.
+    """Return running, stopped, foreign, or unverified.
 
-    A process group ID cannot be reused while any member of the group is alive,
-    so a live group is still ours unless its leader PID now belongs to a
-    process with a different start time.
+    Ownership is proven only by the recorded leader PID still running with its
+    recorded start time. A live group whose leader is gone, or a record with no
+    start time, is unverified: the group ID may have been reused after the
+    original group exited, so it must not be signaled automatically.
     """
     if not group_alive(record["pgid"]):
         return "stopped"
     start = record.get("start")
-    if start and pid_alive(record["pid"]) and ps_field(record["pid"], "lstart") != start:
+    if not start or not pid_alive(record["pid"]):
+        return "unverified"
+    if ps_field(record["pid"], "lstart") != start:
         return "foreign"
     return "running"
 
 
 def lane_has_live_process(lane: dict) -> bool:
-    return any(record_state(record) == "running" for record in lane.get("processes", {}).values())
+    return any(
+        record_state(record) in ("running", "unverified") for record in lane.get("processes", {}).values()
+    )
+
+
+def group_members(pgid: int) -> List[Tuple[int, str]]:
+    probe = subprocess.run(
+        ["ps", "-A", "-o", "pid=,pgid=,command="], capture_output=True, text=True, check=False,
+    )
+    members = []
+    for line in probe.stdout.splitlines():
+        parts = line.split(None, 2)
+        if len(parts) >= 2 and parts[1] == str(pgid):
+            members.append((int(parts[0]), parts[2] if len(parts) == 3 else ""))
+    return members
 
 
 def terminate_group(pgid: int) -> bool:
@@ -407,11 +424,14 @@ def launch(lane: dict, name: str, argv: List[str], display: str) -> Tuple[subpro
             stdout=log, stderr=subprocess.STDOUT, start_new_session=True,
         )
     start = ps_field(process.pid, "lstart")
-    for _ in range(5):
+    for _ in range(20):
         if start or process.poll() is not None:
             break
         time.sleep(0.1)
         start = ps_field(process.pid, "lstart")
+    if not start and process.poll() is None:
+        terminate_group(process.pid)
+        fail(f"could not read the start time of PID {process.pid}, so it could not be tracked; stopped it")
     record = {
         "pid": process.pid,
         "pgid": process.pid,
@@ -421,7 +441,12 @@ def launch(lane: dict, name: str, argv: List[str], display: str) -> Tuple[subpro
         "log": str(log_path),
         "started_at": now_iso(),
     }
-    update_processes(lane, name, record)
+    try:
+        update_processes(lane, name, record)
+    except (OSError, SystemExit) as error:
+        # Without a saved record nothing could stop this group later.
+        terminate_group(process.pid)
+        fail(f"could not record {name} ({error}); stopped PID {process.pid}")
     return process, record
 
 
@@ -438,7 +463,7 @@ def wait_ready(process: Optional[subprocess.Popen], record: dict, ready: Callabl
     return ready()
 
 
-def stop_process(lane: dict, name: str) -> Tuple[bool, str]:
+def stop_process(lane: dict, name: str, force: bool = False) -> Tuple[bool, str]:
     record = lane.get("processes", {}).get(name)
     if record is None:
         return True, f"{name}: not started by this lane"
@@ -449,6 +474,13 @@ def stop_process(lane: dict, name: str) -> Tuple[bool, str]:
     if state == "stopped":
         update_processes(lane, name, None)
         return True, f"{name}: already stopped"
+    if state == "unverified" and not force:
+        members = "; ".join(f"PID {pid} {command[:80]}" for pid, command in group_members(record["pgid"]))
+        return False, (
+            f"{name}: leader PID {record['pid']} is gone but process group {record['pgid']} is still alive "
+            f"({members or 'no members listed'}). Ownership cannot be verified, so nothing was signaled. "
+            "If these are your processes, run `lane.py stop --force`."
+        )
     if not terminate_group(record["pgid"]):
         return False, f"{name}: process group {record['pgid']} did not exit"
     update_processes(lane, name, None)
@@ -465,7 +497,8 @@ def reject_busy(port: int, role: str) -> NoReturn:
 
 def failed_start(lane: dict, name: str, record: dict, reason: str) -> NoReturn:
     output = tail(record["log"])
-    stop_process(lane, name)
+    # This invocation just launched the group, so it is known to be ours.
+    stop_process(lane, name, force=True)
     if output:
         print(output, file=sys.stderr)
     fail(f"{name} {reason}; full log: {record['log']}")
@@ -552,6 +585,9 @@ def cmd_serve(args: argparse.Namespace) -> int:
             return port is None or port_listening(port)
 
     existing = lane.get("processes", {}).get("serve")
+    if existing is not None and record_state(existing) == "unverified":
+        fail("an earlier serve group is still alive but unverified; check it with `lane.py status`, "
+             "then run `lane.py stop --force`")
     if existing is not None and record_state(existing) == "running":
         if not args.restart:
             if not wait_ready(None, existing, ready, args.timeout):
@@ -588,6 +624,9 @@ def cmd_chrome(args: argparse.Namespace) -> int:
     lane = claim_lane(resolve_root(args.root))
     port = lane["cdp_port"]
     existing = lane.get("processes", {}).get("chrome")
+    if existing is not None and record_state(existing) == "unverified":
+        fail("an earlier chrome group is still alive but unverified; check it with `lane.py status`, "
+             "then run `lane.py stop --force`")
     if existing is not None and record_state(existing) == "running":
         info = cdp_version(port)
         if info is not None:
@@ -644,7 +683,7 @@ def cmd_stop(args: argparse.Namespace) -> int:
     if closed:
         print(closed)
     for name in list(lane.get("processes", {})):
-        stopped, message = stop_process(lane, name)
+        stopped, message = stop_process(lane, name, force=args.force)
         ok = ok and stopped
         print(message)
     if args.release:
@@ -725,6 +764,8 @@ def main(argv: Optional[List[str]] = None) -> int:
 
     stop = commands.add_parser("stop", help="close the session and stop processes this lane started")
     stop.add_argument("--release", action="store_true", help="also drop the port claim and delete lane files")
+    stop.add_argument("--force", action="store_true",
+                      help="also stop process groups whose leader exited, after you have checked them")
     stop.set_defaults(handler=cmd_stop)
 
     status = commands.add_parser("status", help="show this worktree's lane")
