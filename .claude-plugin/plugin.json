@@ -1,0 +1,13 @@
+{
+  "name": "splitscreen",
+  "version": "0.1.0",
+  "description": "Local multiplayer for coding agents. Every agent tests its own copy of your web or Electron app, in its own worktree, on its own ports, attached over CDP. No computer use.",
+  "author": {
+    "name": "Nihar",
+    "url": "https://github.com/niharnm"
+  },
+  "license": "MIT",
+  "homepage": "https://github.com/niharnm/splitscreen",
+  "repository": "https://github.com/niharnm/splitscreen",
+  "keywords": ["testing", "electron", "cdp", "agent-browser", "worktrees", "parallel-agents", "browser-automation"]
+}

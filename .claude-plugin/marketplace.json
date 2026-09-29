@@ -1,0 +1,16 @@
+{
+  "name": "splitscreen",
+  "description": "Local multiplayer for coding agents: parallel web and Electron app testing over CDP, without computer use.",
+  "owner": {
+    "name": "Nihar",
+    "url": "https://github.com/niharnm"
+  },
+  "plugins": [
+    {
+      "name": "splitscreen",
+      "source": "./",
+      "description": "Every agent tests its own copy of your web or Electron app, in its own worktree, on its own ports, attached over CDP with agent-browser.",
+      "category": "testing"
+    }
+  ]
+}
